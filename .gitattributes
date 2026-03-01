@@ -1,0 +1,2 @@
+# Automatically compress the json vocab
+vocab.json filter=vocabzstd

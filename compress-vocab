@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+zstd -c "$1" > "$2"
