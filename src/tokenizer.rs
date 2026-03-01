@@ -43,7 +43,7 @@ pub trait Tokenizer {
 
 #[derive(Debug)]
 pub struct SimpleTokenizer {
-    vocab: Vocab,
+    pub vocab: Vocab,
 }
 
 impl SimpleTokenizer {
