@@ -1,4 +1,4 @@
-use crate::dataset::{TextItem, load_fineweb_dataset, load_gutenberg_dataset};
+use crate::dataset::TextItem;
 use burn::data::dataloader::Dataset;
 use burn::data::dataset::SqliteDataset;
 use indicatif::ProgressIterator;
@@ -23,6 +23,7 @@ pub struct Vocab {
     pub tokens2words: Vec<String>, // reverse lookup, indices are the tokens
 }
 impl Vocab {
+    // TODO: Use serde_any instead, serde-file-formats or savefile
     pub fn from_file(path: &Path) -> Self {
         let file = std::fs::File::open(path).expect("Failed to open vocab file");
         let reader = std::io::BufReader::new(file);
