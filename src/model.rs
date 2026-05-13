@@ -1,6 +1,8 @@
 use burn::Tensor;
 use burn::config::Config;
-use burn::nn::{DropoutConfig, LinearConfig};
+use burn::nn::activation::{Activation, ActivationConfig};
+use burn::nn::attention::generate_autoregressive_mask;
+use burn::nn::{DropoutConfig, LayerNorm, LayerNormConfig, LinearConfig};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Bool, Int, activation};
 use burn::{
@@ -57,7 +59,7 @@ pub struct MultiHeadAttention<B: Backend> {
     dropout: Dropout,
     // Causal mask so that the model cannot look into the future:
     // Shape: [context_length, context_length], True = keep, False = mask out
-    mask: Tensor<B, 2, Bool>,
+    // mask: Tensor<B, 2, Bool>,
     num_heads: usize,
     head_dim: usize, // d_out / num_heads
 }
@@ -103,9 +105,9 @@ impl MultiHeadAttentionConfig {
         // Causal mask: lower triangular, shape [context_length, context_length]
         // tril()[i][j] = true  means token i CAN attend to token j (j <= i)
         // tril()[i][j] = false means token i CANNOT attend to token j (future)
-        let mask = Tensor::<B, 2>::ones([self.context_length, self.context_length], device)
-            .tril(0) // keep diagonal and below
-            .bool(); // cast to Bool tensor
+        // let mask = Tensor::<B, 2>::ones([self.context_length, self.context_length], device)
+        //     .tril(0) // keep diagonal and below
+        //     .bool(); // cast to Bool tensor
 
         MultiHeadAttention {
             query_weights,
@@ -113,7 +115,7 @@ impl MultiHeadAttentionConfig {
             value_weights,
             out_projection,
             dropout,
-            mask,
+            // mask,
             num_heads: self.num_heads,
             head_dim,
         }
@@ -129,7 +131,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         // Note: it's fine to clone tensors in burn, it's just a shallow clone
         let keys = self.key_weights.forward(sequence.clone());
         let values = self.value_weights.forward(sequence.clone());
-        let queries = self.query_weights.forward(sequence);
+        let queries = self.query_weights.forward(sequence.clone());
         // Shape is now [batch_size, seq_len, d_out]
 
         // We need to reshape to perform multi-head attention:
@@ -154,12 +156,16 @@ impl<B: Backend> MultiHeadAttention<B> {
         let scale = (self.head_dim as f64).sqrt();
         let attn_scores = queries.matmul(keys.swap_dims(2, 3)) / scale;
 
+        let mask =
+            generate_autoregressive_mask::<B>(batch_size, seq_len, &sequence.clone().device())
+                .unsqueeze::<4>();
+
         // Apply causal mask: slice to actual seq_len (may be < context_length)
-        let mask = self
-            .mask
-            .clone()
-            .slice([0..seq_len, 0..seq_len]) // [SeqLen, SeqLen]
-            .unsqueeze::<4>(); // [1, 1, SeqLen, SeqLen] — broadcasts over B and NumHeads
+        // let mask = self
+        //     .mask
+        //     .clone()
+        //     .slice([0..seq_len, 0..seq_len]) // [SeqLen, SeqLen]
+        //     .unsqueeze::<4>(); // [1, 1, SeqLen, SeqLen] — broadcasts over B and NumHeads
 
         let attn_scores = attn_scores.mask_fill(mask.bool_not(), f32::NEG_INFINITY);
 
@@ -183,6 +189,77 @@ impl<B: Backend> MultiHeadAttention<B> {
     }
 }
 
+// ---------- TransformerBlock
+
+#[derive(Module, Debug)]
+pub struct TransformerBlock<B: Backend> {
+    layer_norm1: LayerNorm<B>,
+    mha: MultiHeadAttention<B>,
+    dropout1: Dropout,
+    layer_norm2: LayerNorm<B>,
+    linear1: Linear<B>,
+    activation: Activation<B>,
+    linear2: Linear<B>,
+    dropout2: Dropout,
+}
+
+#[derive(Config, Debug)]
+pub struct TransformerBlockConfig {
+    mha_config: MultiHeadAttentionConfig,
+    ff_dim: usize, // Size of the hidden layer in the feed-forward network
+    #[config(default = "ActivationConfig::Gelu")]
+    activation: ActivationConfig,
+    #[config(default = 0.1)]
+    dropout_prob: f64, // Dropout probability
+}
+
+impl TransformerBlockConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> TransformerBlock<B> {
+        let d_model = self.mha_config.d_in;
+
+        TransformerBlock {
+            layer_norm1: LayerNormConfig::new(d_model).init(device),
+            mha: self.mha_config.init(device),
+            dropout1: DropoutConfig::new(self.dropout_prob).init(),
+            layer_norm2: LayerNormConfig::new(d_model).init(device),
+            linear1: LinearConfig::new(d_model, self.ff_dim).init(device),
+            activation: self.activation.init(device),
+            linear2: LinearConfig::new(self.ff_dim, d_model).init(device),
+            dropout2: DropoutConfig::new(self.dropout_prob).init(),
+        }
+    }
+}
+
+impl<B: Backend> TransformerBlock<B> {
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let shortcut = x.clone();
+
+        // Layer normalization
+        let x = self.layer_norm1.forward(x);
+        // Self attention
+        let x = self.mha.forward(x);
+
+        let x = self.dropout1.forward(x);
+
+        // Ad the resudual
+        let x = x + shortcut;
+
+        let shortcut = x.clone();
+
+        // Layer norm
+        let x = self.layer_norm2.forward(x);
+
+        // MLP
+        let x = self.linear1.forward(x);
+        let x = self.activation.forward(x);
+        let x = self.linear2.forward(x);
+
+        // Add the residual
+        x + shortcut
+    }
+}
+
+// ----------- TEST ---------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
