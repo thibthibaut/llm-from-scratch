@@ -10,6 +10,66 @@ use burn::{
     nn::{Dropout, Embedding, EmbeddingConfig, Linear},
 };
 
+use crate::tokenizer::Vocab;
+
+// --- GPT model ---
+#[derive(Module, Debug)]
+pub struct GPTModel<B: Backend> {
+    embedding_layer: EmbeddingModule<B>,
+    transformer_layers: Vec<TransformerBlock<B>>,
+    layer_norm: LayerNorm<B>,
+    out_head: Linear<B>, // Final projection from embedding space to vocab space
+}
+
+#[derive(Config, Debug)]
+pub struct GPTModelConfig {
+    embedding_config: EmbeddingModuleConfig,
+    transformer_config: TransformerBlockConfig,
+    #[config(default = 12)]
+    num_transformer_layers: usize,
+}
+
+impl GPTModelConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> GPTModel<B> {
+        let embedding_layer = self.embedding_config.init(device);
+        let transformer_layers = (0..self.num_transformer_layers)
+            .map(|_| self.transformer_config.init(device))
+            .collect();
+        let layer_norm = LayerNormConfig::new(self.embedding_config.d_model).init(device);
+        let out_head = LinearConfig::new(
+            self.embedding_config.d_model,
+            self.embedding_config.vocab_size,
+        )
+        .init(device);
+
+        GPTModel {
+            embedding_layer,
+            transformer_layers,
+            layer_norm,
+            out_head,
+        }
+    }
+}
+
+impl<B: Backend> GPTModel<B> {
+    pub fn forward(&self, indices: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        // 1. Pass through embeddings
+        let mut x = self.embedding_layer.forward(indices);
+
+        // 2. Pass through all transformer blocks
+        for layer in self.transformer_layers.iter() {
+            x = layer.forward(x);
+        }
+
+        // 3. Final layer norm
+        x = self.layer_norm.forward(x);
+
+        // 4. Output projection to vocabulary size
+        self.out_head.forward(x)
+    }
+}
+
+// --- Embedding layer ---
 #[derive(Module, Debug)]
 pub struct EmbeddingModule<B: Backend> {
     token_embedding: Embedding<B>,
