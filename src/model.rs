@@ -30,7 +30,7 @@ pub struct GPTModelConfig {
 }
 
 impl GPTModelConfig {
-    fn init<B: Backend>(&self, device: &B::Device) -> GPTModel<B> {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> GPTModel<B> {
         let embedding_layer = self.embedding_config.init(device);
         let transformer_layers = (0..self.num_transformer_layers)
             .map(|_| self.transformer_config.init(device))
@@ -126,10 +126,11 @@ pub struct MultiHeadAttention<B: Backend> {
 
 #[derive(Config, Debug)]
 pub struct MultiHeadAttentionConfig {
-    d_in: usize,           // Input embedding dimension
-    d_out: usize,          // Total output dimension (must be divisible by num_heads)
-    context_length: usize, // Max sequence length, needed for the causal mask
-    num_heads: usize,      // Number of attention heads
+    d_in: usize,  // Input embedding dimension
+    d_out: usize, // Total output dimension (must be divisible by num_heads)
+    // context_length: usize, // Max sequence length, needed for the causal mask
+    #[config(default = 12)]
+    num_heads: usize, // Number of attention heads
     #[config(default = 0.1)]
     dropout_prob: f64, // Dropout probability
 }
@@ -218,7 +219,7 @@ impl<B: Backend> MultiHeadAttention<B> {
 
         let mask =
             generate_autoregressive_mask::<B>(batch_size, seq_len, &sequence.clone().device())
-                .unsqueeze::<4>();
+                .unsqueeze_dim::<4>(1);
 
         // Apply causal mask: slice to actual seq_len (may be < context_length)
         // let mask = self
@@ -227,7 +228,8 @@ impl<B: Backend> MultiHeadAttention<B> {
         //     .slice([0..seq_len, 0..seq_len]) // [SeqLen, SeqLen]
         //     .unsqueeze::<4>(); // [1, 1, SeqLen, SeqLen] — broadcasts over B and NumHeads
 
-        let attn_scores = attn_scores.mask_fill(mask.bool_not(), f32::NEG_INFINITY);
+        let masking_value: f32 = -1.0e4_f32; // f32::NEG_INFINITY
+        let attn_scores = attn_scores.mask_fill(mask.bool_not(), masking_value);
 
         // Softmax over last dim (the key dimension)
         let attn_weights = activation::softmax(attn_scores, 3); // dim=3 = SeqLen of keys
@@ -266,7 +268,8 @@ pub struct TransformerBlock<B: Backend> {
 #[derive(Config, Debug)]
 pub struct TransformerBlockConfig {
     mha_config: MultiHeadAttentionConfig,
-    ff_dim: usize, // Size of the hidden layer in the feed-forward network
+    #[config(default = 4)]
+    ff_expansion_factor: usize,
     #[config(default = "ActivationConfig::Gelu")]
     activation: ActivationConfig,
     #[config(default = 0.1)]
@@ -276,15 +279,17 @@ pub struct TransformerBlockConfig {
 impl TransformerBlockConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> TransformerBlock<B> {
         let d_model = self.mha_config.d_in;
+        let ff_dim: usize = d_model * self.ff_expansion_factor;
 
         TransformerBlock {
             layer_norm1: LayerNormConfig::new(d_model).init(device),
             mha: self.mha_config.init(device),
             dropout1: DropoutConfig::new(self.dropout_prob).init(),
             layer_norm2: LayerNormConfig::new(d_model).init(device),
-            linear1: LinearConfig::new(d_model, self.ff_dim).init(device),
+
+            linear1: LinearConfig::new(d_model, ff_dim).init(device),
             activation: self.activation.init(device),
-            linear2: LinearConfig::new(self.ff_dim, d_model).init(device),
+            linear2: LinearConfig::new(ff_dim, d_model).init(device),
             dropout2: DropoutConfig::new(self.dropout_prob).init(),
         }
     }
@@ -336,12 +341,12 @@ mod tests {
         let d_in = 16;
         let d_out = 16;
         let num_heads = 4;
-        let context_length = 10;
+        // let context_length = 10;
 
         let mha = MultiHeadAttentionConfig {
             d_in,
             d_out,
-            context_length,
+            // context_length,
             num_heads,
             dropout_prob: 0.0, // no dropout during testing
         }
@@ -371,7 +376,7 @@ mod tests {
         let mha = MultiHeadAttentionConfig {
             d_in: 8,
             d_out: 8,
-            context_length: 6,
+            // context_length: 6,
             num_heads: 2,
             dropout_prob: 0.0,
         }
@@ -402,7 +407,7 @@ mod tests {
         MultiHeadAttentionConfig {
             d_in: 8,
             d_out: 10,
-            context_length: 6,
+            // context_length: 6,
             num_heads: 3,
             dropout_prob: 0.0,
         }

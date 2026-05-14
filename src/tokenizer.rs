@@ -40,6 +40,7 @@ impl Vocab {
 pub trait Tokenizer {
     fn encode(&self, text: &str) -> Vec<Token>;
     fn decode(&self, tokens: &[Token]) -> String;
+    fn get_vocab_size(&self) -> usize;
 }
 
 #[derive(Debug)]
@@ -159,5 +160,9 @@ impl Tokenizer for SimpleTokenizer {
 
         // Remove spaces before puctuation
         Self::punct_regex().replace_all(&text, "$1").to_string()
+    }
+
+    fn get_vocab_size(&self) -> usize {
+        self.vocab.tokens2words.len()
     }
 }
