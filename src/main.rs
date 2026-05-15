@@ -7,9 +7,12 @@ use crate::model::GPTModelConfig;
 use crate::model::MultiHeadAttentionConfig;
 use crate::model::TransformerBlockConfig;
 use crate::tokenizer::SimpleTokenizer;
+use crate::tokenizer::Token;
 use crate::tokenizer::Tokenizer;
 use burn::Tensor;
 use burn::prelude::Backend;
+use burn::tensor::Int;
+use burn::tensor::ElementConversion;
 // use burn::backend::Autodiff;
 use burn::backend::Wgpu;
 mod dataset;
@@ -51,6 +54,54 @@ fn build_gpt_model<B: Backend>(
     gpt_config.init(device)
 }
 
+fn generate_text<B: Backend>(
+    model: &GPTModel<B>,
+    tokenizer: &SimpleTokenizer,
+    prompt: &str,
+    max_new_tokens: usize,
+    context_length: usize,
+    device: &B::Device,
+) -> String {
+    let mut tokens = tokenizer.encode(prompt);
+    let vocab_size = tokenizer.get_vocab_size();
+
+    for _ in 0..max_new_tokens {
+        // Truncate if longer than context length
+        let start = if tokens.len() > context_length {
+            tokens.len() - context_length
+        } else {
+            0
+        };
+        let input_tokens = &tokens[start..];
+
+        // Create input tensor [1, seq_len]
+        let indices: Vec<i32> = input_tokens.iter().map(|t| t.0 as i32).collect();
+        let input_tensor = Tensor::<B, 1, Int>::from_data(indices.as_slice(), device)
+            .reshape([1, input_tokens.len()]);
+
+        // Forward pass
+        let output = model.forward(input_tensor); // [1, seq_len, vocab_size]
+
+        // Get logits for the last position and find the token with highest score
+        let last_logits = output
+            .slice([0..1, input_tokens.len() - 1..input_tokens.len(), 0..vocab_size]);
+        let next_token_tensor = last_logits.argmax(2); // [1, 1, Int]
+
+        // Extract token id from the 1-element tensor
+        let next_token_id = next_token_tensor
+            .into_scalar();
+        let next_token = Token(next_token_id.elem::<u32>());
+        tokens.push(next_token);
+
+        // Stop if end of text token
+        if next_token.0 == Token::END_OF_TEXT.0 {
+            break;
+        }
+    }
+
+    tokenizer.decode(&tokens)
+}
+
 fn main() {
     //generate_tokenizer_vocab();
 
@@ -59,26 +110,13 @@ fn main() {
     let vocab_size = tok.get_vocab_size();
 
     println!("Vocab size {}", vocab_size);
-    let prompt = "A Hello. This is a text to transform. Why are we doing that? Banana. 12. a1a. I don't know";
-    let tokens = tok.encode(prompt);
-    let text = tok.decode(&tokens);
-    println!("original {:?}", prompt);
-    println!("tokens {:?}", tokens);
-    println!("text {:?}", text);
-
-    // type MyBackend = Wgpu<f32, i32>;
 
     let device = Default::default();
-
     let gpt_model = build_gpt_model::<Wgpu>(vocab_size, 1024, 768, &device);
 
-    // Create an input tensor
-    let indices: Vec<i32> = tokens.iter().map(|x| x.0 as i32).collect();
-    let indices: Tensor<Wgpu, 1, burn::tensor::Int> =
-        Tensor::from_data(indices.as_slice(), &device);
+    let prompt = "A Hello. This is a text to transform.";
+    println!("Prompt: {}", prompt);
 
-    let indices = indices.reshape([2, 15]);
-    let output = gpt_model.forward(indices);
-
-    println!("Model output{}", output);
+    let generated = generate_text(&gpt_model, &tok, prompt, 20, 1024, &device);
+    println!("Generated: {}", generated);
 }
