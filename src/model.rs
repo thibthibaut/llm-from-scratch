@@ -23,8 +23,8 @@ pub struct GPTModel<B: Backend> {
 
 #[derive(Config, Debug)]
 pub struct GPTModelConfig {
-    embedding_config: EmbeddingModuleConfig,
-    transformer_config: TransformerBlockConfig,
+    pub embedding_config: EmbeddingModuleConfig,
+    pub transformer_config: TransformerBlockConfig,
     #[config(default = 12)]
     num_transformer_layers: usize,
 }
@@ -78,9 +78,9 @@ pub struct EmbeddingModule<B: Backend> {
 
 #[derive(Config, Debug)]
 pub struct EmbeddingModuleConfig {
+    pub context_size: usize,
     vocab_size: usize,
     d_model: usize,
-    context_size: usize,
 }
 
 impl EmbeddingModuleConfig {

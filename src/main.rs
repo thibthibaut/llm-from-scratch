@@ -11,13 +11,14 @@ use crate::tokenizer::Token;
 use crate::tokenizer::Tokenizer;
 use burn::Tensor;
 use burn::prelude::Backend;
-use burn::tensor::Int;
 use burn::tensor::ElementConversion;
+use burn::tensor::Int;
 // use burn::backend::Autodiff;
 use burn::backend::Wgpu;
 mod dataset;
 mod model;
 mod tokenizer;
+mod training;
 
 fn generate_tokenizer_vocab() {
     // let dataset = load_fineweb_dataset();
@@ -83,13 +84,15 @@ fn generate_text<B: Backend>(
         let output = model.forward(input_tensor); // [1, seq_len, vocab_size]
 
         // Get logits for the last position and find the token with highest score
-        let last_logits = output
-            .slice([0..1, input_tokens.len() - 1..input_tokens.len(), 0..vocab_size]);
+        let last_logits = output.slice([
+            0..1,
+            input_tokens.len() - 1..input_tokens.len(),
+            0..vocab_size,
+        ]);
         let next_token_tensor = last_logits.argmax(2); // [1, 1, Int]
 
         // Extract token id from the 1-element tensor
-        let next_token_id = next_token_tensor
-            .into_scalar();
+        let next_token_id = next_token_tensor.into_scalar();
         let next_token = Token(next_token_id.elem::<u32>());
         tokens.push(next_token);
 

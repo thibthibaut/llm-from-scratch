@@ -1,3 +1,5 @@
+use burn::data::dataset::Dataset;
+use burn::data::dataset::transform::PartialDataset;
 use burn::data::dataset::{HuggingfaceDatasetLoader, SqliteDataset};
 use burn::tensor::Int;
 use burn::{data::dataloader::batcher::Batcher, prelude::*};
@@ -6,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::tokenizer::{SimpleTokenizer, Tokenizer, Vocab};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct TextItem {
@@ -28,6 +31,29 @@ pub fn _load_fineweb_dataset() -> SqliteDataset<TextItem> {
 }
 pub fn load_fineweb_dataset_from_disk(path: &str) -> SqliteDataset<TextItem> {
     SqliteDataset::from_db_file(path, "train").expect("Failed to load SQLite dataset")
+}
+
+/// Helper to split the dataset
+pub fn split_dataset(
+    dataset: SqliteDataset<TextItem>,
+) -> (
+    PartialDataset<Arc<SqliteDataset<TextItem>>, TextItem>,
+    PartialDataset<Arc<SqliteDataset<TextItem>>, TextItem>,
+    PartialDataset<Arc<SqliteDataset<TextItem>>, TextItem>,
+) {
+    let len = dataset.len();
+    let arc_dataset = Arc::new(dataset);
+
+    // Define standard 80/10/10 split indices
+    let train_end = (len as f32 * 0.8) as usize;
+    let val_end = train_end + ((len as f32 * 0.1) as usize);
+
+    // Create partial datasets using slice indices
+    let train_dataset = PartialDataset::new(arc_dataset.clone(), 0, train_end);
+    let val_dataset = PartialDataset::new(arc_dataset.clone(), train_end, val_end);
+    let test_dataset = PartialDataset::new(arc_dataset, val_end, len);
+
+    (train_dataset, val_dataset, test_dataset)
 }
 
 //--- Batcher ---
@@ -102,8 +128,8 @@ impl<T: Tokenizer + Send + Sync, B: Backend> Batcher<B, TextItem, TextBatch<B>> 
                 0
             };
 
-            let input = t.clone().slice([start..start + seq_len]);
-            let target = t.slice([start + 1..start + seq_len + 1]);
+            let input = t.clone().slice(start..start + seq_len);
+            let target = t.slice(start + 1..start + seq_len + 1);
 
             inputs.push(input);
             targets.push(target);
@@ -238,11 +264,9 @@ mod tests {
         // Long text: 10 tokens -> [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         // seq_len = min(10 - 1, 3) = 3
         // max_start = 10 - 3 - 1 = 6 -> multiple possible starting positions
-        let items = vec![
-            TextItem {
-                text: "a b c d e f g h i j".to_string(),
-            },
-        ];
+        let items = vec![TextItem {
+            text: "a b c d e f g h i j".to_string(),
+        }];
 
         let batch: TextBatch<TestBackend> = batcher.batch(items.clone(), &device);
 
