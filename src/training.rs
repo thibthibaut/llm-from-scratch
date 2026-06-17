@@ -9,7 +9,7 @@ use burn::optim::AdamWConfig;
 use burn::prelude::*;
 use burn::record::CompactRecorder;
 use burn::tensor::backend::AutodiffBackend;
-use burn::train::metric::{AccuracyMetric, LossMetric};
+use burn::train::metric::{LossMetric, PerplexityMetric, TopKAccuracyMetric};
 use burn::train::{
     InferenceStep, Learner, SequenceOutput, SupervisedTraining, TrainOutput, TrainStep,
 };
@@ -117,7 +117,11 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
         .build(valid_ds);
 
     let training = SupervisedTraining::new(artifact_dir, dataloader_train, dataloader_test)
-        .metrics((AccuracyMetric::new(), LossMetric::new()))
+        .metrics((
+            LossMetric::new(),
+            PerplexityMetric::new(),
+            TopKAccuracyMetric::new(5),
+        ))
         .with_file_checkpointer(CompactRecorder::new())
         .num_epochs(config.num_epochs)
         .summary();
