@@ -9,6 +9,7 @@ use burn::optim::AdamWConfig;
 use burn::prelude::*;
 use burn::record::CompactRecorder;
 use burn::tensor::backend::AutodiffBackend;
+use burn::train::metric::{AccuracyMetric, LossMetric};
 use burn::train::{
     InferenceStep, Learner, SequenceOutput, SupervisedTraining, TrainOutput, TrainStep,
 };

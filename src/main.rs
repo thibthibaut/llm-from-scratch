@@ -9,7 +9,10 @@ use crate::model::TransformerBlockConfig;
 use crate::tokenizer::SimpleTokenizer;
 use crate::tokenizer::Token;
 use crate::tokenizer::Tokenizer;
+use crate::training::TrainingConfig;
 use burn::Tensor;
+use burn::backend::Autodiff;
+use burn::optim::AdamWConfig;
 use burn::prelude::Backend;
 use burn::tensor::ElementConversion;
 use burn::tensor::Int;
@@ -111,15 +114,35 @@ fn main() {
     let tok = SimpleTokenizer::from_vocab_file(Path::new("vocab.json"));
 
     let vocab_size = tok.get_vocab_size();
+    let context_length = 512;
+    let d_model = 144;
+    let batch_size = 2;
 
-    println!("Vocab size {}", vocab_size);
+    // println!("Vocab size {}", vocab_size);
 
-    let device = Default::default();
-    let gpt_model = build_gpt_model::<Wgpu>(vocab_size, 1024, 768, &device);
+    // let device = Default::default();
+    // let gpt_model = build_gpt_model::<Wgpu>(vocab_size, 1024, 768, &device);
 
-    let prompt = "A Hello. This is a text to transform.";
-    println!("Prompt: {}", prompt);
+    // let prompt = "A Hello. This is a text to transform.";
+    // println!("Prompt: {}", prompt);
 
-    let generated = generate_text(&gpt_model, &tok, prompt, 20, 1024, &device);
-    println!("Generated: {}", generated);
+    // let generated = generate_text(&gpt_model, &tok, prompt, 20, 1024, &device);
+    // println!("Generated: {}", generated);
+
+    type MyBackend = Wgpu<f32, i32>;
+    type MyAutodiffBackend = Autodiff<MyBackend>;
+
+    let device = burn::backend::wgpu::WgpuDevice::default();
+    let artifact_dir = "artifacts";
+
+    let embedding_config = EmbeddingModuleConfig::new(context_length, vocab_size, d_model);
+    let mha_config = MultiHeadAttentionConfig::new(d_model, d_model);
+    let transformer_config = TransformerBlockConfig::new(mha_config);
+    let gpt_config = GPTModelConfig::new(embedding_config, transformer_config);
+
+    crate::training::train::<MyAutodiffBackend>(
+        artifact_dir,
+        TrainingConfig::new(gpt_config, AdamWConfig::new()).with_batch_size(batch_size),
+        device.clone(),
+    );
 }

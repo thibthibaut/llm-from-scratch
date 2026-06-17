@@ -17,7 +17,7 @@ impl Token {
 }
 
 /// Vocabulary with lookup and reverse lookup from text to tokens
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Vocab {
     pub words2tokens: HashMap<String, Token>,
     pub tokens2words: Vec<String>, // reverse lookup, indices are the tokens
@@ -43,7 +43,7 @@ pub trait Tokenizer {
     fn get_vocab_size(&self) -> usize;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SimpleTokenizer {
     pub vocab: Vocab,
 }
