@@ -16,6 +16,7 @@ pub struct GPTModel<B: Backend> {
     embedding_layer: EmbeddingModule<B>,
     transformer_layers: Vec<TransformerBlock<B>>,
     layer_norm: LayerNorm<B>,
+    out_head: Linear<B>, // Final projection from embedding space to vocab space
 }
 
 #[derive(Config, Debug)]
@@ -33,11 +34,17 @@ impl GPTModelConfig {
             .map(|_| self.transformer_config.init(device))
             .collect();
         let layer_norm = LayerNormConfig::new(self.embedding_config.d_model).init(device);
+        let out_head = LinearConfig::new(
+            self.embedding_config.d_model,
+            self.embedding_config.vocab_size,
+        )
+        .init(device);
 
         GPTModel {
             embedding_layer,
             transformer_layers,
             layer_norm,
+            out_head,
         }
     }
 }
@@ -55,19 +62,8 @@ impl<B: Backend> GPTModel<B> {
         // 3. Final layer norm
         x = self.layer_norm.forward(x);
 
-        // 4. Output projection to vocabulary size, tied to token embeddings
-        let [batch_size, sequence_length, d_model] = x.dims();
-        let vocab_size = self
-            .embedding_layer
-            .token_embedding
-            .weight
-            .shape()
-            .dims::<2>()[0];
-        let token_embedding = self.embedding_layer.token_embedding.weight.val();
-
-        x.reshape([batch_size * sequence_length, d_model])
-            .matmul(token_embedding.transpose())
-            .reshape([batch_size, sequence_length, vocab_size])
+        // 4. Output projection to vocabulary size
+        self.out_head.forward(x)
     }
 }
 
@@ -359,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gpt_model_output_shape_with_tied_embeddings() {
+    fn test_gpt_model_output_shape() {
         let device = Default::default();
         let model = test_gpt_config(4).init::<TestBackend>(&device);
         let indices = Tensor::<TestBackend, 1, Int>::from_data([0, 1, 2, 3].as_slice(), &device)
