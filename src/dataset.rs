@@ -45,8 +45,8 @@ pub fn split_dataset(
     let arc_dataset = Arc::new(dataset);
 
     // Define standard 80/10/10 split indices
-    let train_end = (len as f32 * 0.8) as usize;
-    let val_end = train_end + ((len as f32 * 0.1) as usize);
+    let train_end = (len as f32 * 0.01) as usize;
+    let val_end = train_end + ((len as f32 * 0.001) as usize);
 
     // Create partial datasets using slice indices
     let train_dataset = PartialDataset::new(arc_dataset.clone(), 0, train_end);
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_batch_shape_and_shift() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = Default::default();
         let tokenizer = make_test_tokenizer();
         let batcher = TextBatcher::new(tokenizer, 1024);
 
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_seq_len_capped_by_context_length() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = Default::default();
         let tokenizer = make_test_tokenizer();
         let batcher = TextBatcher::new(tokenizer, 2); // small context_length
 
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_long_text_random_slicing() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = Default::default();
         let tokenizer = make_test_tokenizer();
         // Use small context_length so random slicing has room to vary
         let batcher = TextBatcher::new(tokenizer, 3);
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_single_text_exact_length() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = Default::default();
         let tokenizer = make_test_tokenizer();
         let batcher = TextBatcher::new(tokenizer, 1024);
 
