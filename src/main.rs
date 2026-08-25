@@ -48,8 +48,8 @@ const VOCAB_PATH: &str = "vocab.json";
 
 // Default architecture parameters, tuned to fit comfortably in 6 GB on a Mac.
 // `d_model` must be divisible by `num_heads` (so head_dim = d_model / num_heads).
-const D_MODEL: usize = 128;
-const NUM_HEADS: usize = 8;
+const D_MODEL: usize = 768;
+const NUM_HEADS: usize = 12;
 const NUM_LAYERS: usize = 12;
 const CONTEXT_LENGTH: usize = 1024;
 const BATCH_SIZE: usize = 64;
@@ -183,7 +183,7 @@ fn run_train(
 
     let gpt_config = gpt_model_config(vocab_size, context_length, d_model, num_heads, num_layers);
 
-    crate::training::train::<MyAutodiffBackend>(
+    crate::training::train_from_disk::<MyAutodiffBackend>(
         artifact_dir,
         TrainingConfig::new(gpt_config, AdamWConfig::new()).with_batch_size(batch_size),
         device.clone(),
