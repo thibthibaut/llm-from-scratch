@@ -25,10 +25,9 @@ pub fn _load_gutenberg_dataset() -> SqliteDataset<TextItem> {
 /// Path to the cached fineweb-edu sqlite file that `burn-dataset` downloaded
 /// under `~/.cache/burn-dataset`.
 pub fn default_fineweb_dataset_path() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME environment variable must be set");
-    PathBuf::from(home)
-        .join(".cache")
-        .join("burn-dataset")
+    // let home = std::env::var("HOME").expect("HOME environment variable must be set");
+    PathBuf::from("/")
+        .join("workspace")
         .join("HuggingFaceFWfineweb-edu-sample-10BT.db")
 }
 
@@ -44,9 +43,17 @@ pub fn load_default_fineweb_dataset() -> SqliteDataset<TextItem> {
     load_fineweb_dataset_from_disk(path)
 }
 
-/// Helper to split the dataset
+/// Helper to split the dataset.
+///
+/// `max_train_items` optionally caps the size of the train split (taking its first N items)
+/// without moving the validation/test boundaries. Burn's checkpointing strategy only fires at
+/// epoch boundaries, so a full-corpus epoch on a dataset this size means waiting days for the
+/// first checkpoint; capping train to a smaller slice makes epochs (and therefore checkpoints)
+/// land at a practical cadence. The tradeoff: within a single run, every epoch reuses the same
+/// capped slice rather than sweeping fresh data each time.
 pub fn split_dataset(
     dataset: SqliteDataset<TextItem>,
+    max_train_items: Option<usize>,
 ) -> (
     PartialDataset<Arc<SqliteDataset<TextItem>>, TextItem>,
     PartialDataset<Arc<SqliteDataset<TextItem>>, TextItem>,
@@ -56,12 +63,18 @@ pub fn split_dataset(
     let arc_dataset = Arc::new(dataset);
 
     // Define standard 80/10/10 split indices
-    let train_end = (len as f32 * 0.8) as usize;
-    let val_end = train_end + ((len as f32 * 0.1) as usize);
+    let train_end_full = (len as f32 * 0.8) as usize;
+    let val_end = train_end_full + ((len as f32 * 0.1) as usize);
+
+    // Optionally cap the train split; validation/test boundaries are unaffected.
+    let train_end = match max_train_items {
+        Some(cap) => cap.min(train_end_full),
+        None => train_end_full,
+    };
 
     // Create partial datasets using slice indices
     let train_dataset = PartialDataset::new(arc_dataset.clone(), 0, train_end);
-    let val_dataset = PartialDataset::new(arc_dataset.clone(), train_end, val_end);
+    let val_dataset = PartialDataset::new(arc_dataset.clone(), train_end_full, val_end);
     let test_dataset = PartialDataset::new(arc_dataset, val_end, len);
 
     (train_dataset, val_dataset, test_dataset)

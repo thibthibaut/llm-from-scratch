@@ -53,6 +53,14 @@ const NUM_HEADS: usize = 12;
 const NUM_LAYERS: usize = 12;
 const CONTEXT_LENGTH: usize = 1024;
 const BATCH_SIZE: usize = 64;
+// Burn's checkpointing strategy only fires at epoch boundaries, so a full-corpus epoch on a
+// multi-million-row dataset means waiting days for the first checkpoint. Cap the train split
+// so an epoch finishes in minutes instead; see `split_dataset` for the tradeoff this makes.
+const EPOCH_SIZE: usize = 24_000;
+// High ceiling; in practice runs are stopped manually once the checkpointed loss looks good,
+// relying on burn-train's default keep-best-by-validation-loss checkpointing strategy.
+const NUM_EPOCHS: usize = 200;
+const NUM_WORKERS: usize = 32;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -89,6 +97,17 @@ enum Commands {
         /// Device to train on: `cpu`, `cuda` (or `cuda:N`), `mps`, `vulkan`.
         #[arg(long, default_value = "cpu", value_parser = parse_device)]
         device: LibTorchDevice,
+        /// Cap the train split to this many items, so an epoch (and therefore a checkpoint,
+        /// since burn-train only checkpoints at epoch boundaries) lands at a practical
+        /// cadence instead of requiring a full sweep of the dataset. 0 disables the cap.
+        #[arg(long, default_value_t = EPOCH_SIZE)]
+        epoch_size: usize,
+        /// Number of epochs (bounded train-split passes) before training stops on its own.
+        #[arg(long, default_value_t = NUM_EPOCHS)]
+        num_epochs: usize,
+        /// Number of background dataloader worker threads.
+        #[arg(long, default_value_t = NUM_WORKERS)]
+        num_workers: usize,
     },
     /// Initialize the dataloader, generate a batch, detokenize it and display it.
     InspectBatch {
@@ -172,6 +191,9 @@ fn run_train(
     context_length: usize,
     batch_size: usize,
     device: LibTorchDevice,
+    epoch_size: usize,
+    num_epochs: usize,
+    num_workers: usize,
 ) {
     type MyBackend = LibTorch<f32>;
     type MyAutodiffBackend = Autodiff<MyBackend>;
@@ -182,11 +204,20 @@ fn run_train(
     let vocab_size = tokenizer.get_vocab_size();
 
     let gpt_config = gpt_model_config(vocab_size, context_length, d_model, num_heads, num_layers);
+    let max_train_items = if epoch_size == 0 {
+        None
+    } else {
+        Some(epoch_size)
+    };
 
     crate::training::train_from_disk::<MyAutodiffBackend>(
         artifact_dir,
-        TrainingConfig::new(gpt_config, AdamWConfig::new()).with_batch_size(batch_size),
+        TrainingConfig::new(gpt_config, AdamWConfig::new())
+            .with_batch_size(batch_size)
+            .with_num_epochs(num_epochs)
+            .with_num_workers(num_workers),
         device.clone(),
+        max_train_items,
     );
 }
 
@@ -198,7 +229,7 @@ fn run_inspect_batch(batch_size: usize, context_size: usize) {
     let batcher = TextBatcher::new(tokenizer.clone(), context_size);
 
     let dataset = load_default_fineweb_dataset();
-    let (train_ds, _valid_ds, _test_ds) = split_dataset(dataset);
+    let (train_ds, _valid_ds, _test_ds) = split_dataset(dataset, None);
 
     let dataloader: Arc<dyn DataLoader<MyBackend, TextBatch<MyBackend>>> =
         DataLoaderBuilder::new(batcher)
@@ -408,6 +439,9 @@ fn main() {
             context_length,
             batch_size,
             device,
+            epoch_size,
+            num_epochs,
+            num_workers,
         } => run_train(
             d_model,
             num_heads,
@@ -415,6 +449,9 @@ fn main() {
             context_length,
             batch_size,
             device,
+            epoch_size,
+            num_epochs,
+            num_workers,
         ),
         Commands::InspectBatch {
             batch_size,
