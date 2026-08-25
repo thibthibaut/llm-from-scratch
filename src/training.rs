@@ -151,17 +151,19 @@ pub fn train<B: AutodiffBackend, D: Dataset<TextItem> + 'static>(
 
 /// Load the tokenizer and the full fineweb dataset from disk, then run `train`.
 ///
-/// `max_train_items` caps the train split size — see `split_dataset` for why that matters for
-/// checkpoint cadence.
+/// `max_train_items`/`max_valid_items` cap the train/validation split sizes — see
+/// `split_dataset` for why that matters for checkpoint cadence.
 pub fn train_from_disk<B: AutodiffBackend>(
     artifact_dir: &str,
     config: TrainingConfig,
     device: B::Device,
     max_train_items: Option<usize>,
+    max_valid_items: Option<usize>,
 ) {
     let tokenizer = SimpleTokenizer::from_vocab_file(Path::new("vocab.json"));
     let fine_web_dataset = load_default_fineweb_dataset();
-    let (train_ds, valid_ds, _test_ds) = split_dataset(fine_web_dataset, max_train_items);
+    let (train_ds, valid_ds, _test_ds) =
+        split_dataset(fine_web_dataset, max_train_items, max_valid_items);
     train::<B, _>(artifact_dir, config, device, tokenizer, train_ds, valid_ds);
 }
 

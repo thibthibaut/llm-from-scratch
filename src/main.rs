@@ -57,6 +57,10 @@ const BATCH_SIZE: usize = 64;
 // multi-million-row dataset means waiting days for the first checkpoint. Cap the train split
 // so an epoch finishes in minutes instead; see `split_dataset` for the tradeoff this makes.
 const EPOCH_SIZE: usize = 24_000;
+// Validation runs every epoch too, so it needs the same kind of cap — otherwise it's the full
+// (uncapped) 10% validation split running against a training epoch that's now a small slice of
+// the corpus. Matches EPOCH_SIZE's original 80/10 train/valid ratio.
+const VALID_SIZE: usize = 2_400;
 // High ceiling; in practice runs are stopped manually once the checkpointed loss looks good,
 // relying on burn-train's default keep-best-by-validation-loss checkpointing strategy.
 const NUM_EPOCHS: usize = 200;
@@ -102,6 +106,11 @@ enum Commands {
         /// cadence instead of requiring a full sweep of the dataset. 0 disables the cap.
         #[arg(long, default_value_t = EPOCH_SIZE)]
         epoch_size: usize,
+        /// Cap the validation split to this many items — runs every epoch, so it needs the
+        /// same kind of cap as --epoch-size or it dwarfs a capped training epoch. 0 disables
+        /// the cap.
+        #[arg(long, default_value_t = VALID_SIZE)]
+        valid_size: usize,
         /// Number of epochs (bounded train-split passes) before training stops on its own.
         #[arg(long, default_value_t = NUM_EPOCHS)]
         num_epochs: usize,
@@ -192,6 +201,7 @@ fn run_train(
     batch_size: usize,
     device: LibTorchDevice,
     epoch_size: usize,
+    valid_size: usize,
     num_epochs: usize,
     num_workers: usize,
 ) {
@@ -209,6 +219,11 @@ fn run_train(
     } else {
         Some(epoch_size)
     };
+    let max_valid_items = if valid_size == 0 {
+        None
+    } else {
+        Some(valid_size)
+    };
 
     crate::training::train_from_disk::<MyAutodiffBackend>(
         artifact_dir,
@@ -218,6 +233,7 @@ fn run_train(
             .with_num_workers(num_workers),
         device.clone(),
         max_train_items,
+        max_valid_items,
     );
 }
 
@@ -229,7 +245,7 @@ fn run_inspect_batch(batch_size: usize, context_size: usize) {
     let batcher = TextBatcher::new(tokenizer.clone(), context_size);
 
     let dataset = load_default_fineweb_dataset();
-    let (train_ds, _valid_ds, _test_ds) = split_dataset(dataset, None);
+    let (train_ds, _valid_ds, _test_ds) = split_dataset(dataset, None, None);
 
     let dataloader: Arc<dyn DataLoader<MyBackend, TextBatch<MyBackend>>> =
         DataLoaderBuilder::new(batcher)
@@ -440,6 +456,7 @@ fn main() {
             batch_size,
             device,
             epoch_size,
+            valid_size,
             num_epochs,
             num_workers,
         } => run_train(
@@ -450,6 +467,7 @@ fn main() {
             batch_size,
             device,
             epoch_size,
+            valid_size,
             num_epochs,
             num_workers,
         ),

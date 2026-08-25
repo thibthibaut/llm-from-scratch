@@ -45,15 +45,18 @@ pub fn load_default_fineweb_dataset() -> SqliteDataset<TextItem> {
 
 /// Helper to split the dataset.
 ///
-/// `max_train_items` optionally caps the size of the train split (taking its first N items)
-/// without moving the validation/test boundaries. Burn's checkpointing strategy only fires at
-/// epoch boundaries, so a full-corpus epoch on a dataset this size means waiting days for the
-/// first checkpoint; capping train to a smaller slice makes epochs (and therefore checkpoints)
-/// land at a practical cadence. The tradeoff: within a single run, every epoch reuses the same
-/// capped slice rather than sweeping fresh data each time.
+/// `max_train_items`/`max_valid_items` optionally cap the size of the train/validation splits
+/// (taking each one's first N items) without moving the underlying 80/10/10 boundaries — the
+/// test split's start point is always the true (uncapped) validation end, so it stays fixed
+/// and non-overlapping regardless of capping. Burn's checkpointing strategy only fires at
+/// epoch boundaries, so a full-corpus epoch (and full-corpus validation pass) on a dataset this
+/// size means waiting days for the first checkpoint; capping both to a smaller slice makes
+/// epochs (and therefore checkpoints) land at a practical cadence. The tradeoff: within a
+/// single run, every epoch reuses the same capped slices rather than sweeping fresh data.
 pub fn split_dataset(
     dataset: SqliteDataset<TextItem>,
     max_train_items: Option<usize>,
+    max_valid_items: Option<usize>,
 ) -> (
     PartialDataset<Arc<SqliteDataset<TextItem>>, TextItem>,
     PartialDataset<Arc<SqliteDataset<TextItem>>, TextItem>,
@@ -64,18 +67,22 @@ pub fn split_dataset(
 
     // Define standard 80/10/10 split indices
     let train_end_full = (len as f32 * 0.8) as usize;
-    let val_end = train_end_full + ((len as f32 * 0.1) as usize);
+    let val_end_full = train_end_full + ((len as f32 * 0.1) as usize);
 
-    // Optionally cap the train split; validation/test boundaries are unaffected.
+    // Optionally cap the train/validation splits; the test split boundary is unaffected.
     let train_end = match max_train_items {
         Some(cap) => cap.min(train_end_full),
         None => train_end_full,
+    };
+    let val_end = match max_valid_items {
+        Some(cap) => (train_end_full + cap).min(val_end_full),
+        None => val_end_full,
     };
 
     // Create partial datasets using slice indices
     let train_dataset = PartialDataset::new(arc_dataset.clone(), 0, train_end);
     let val_dataset = PartialDataset::new(arc_dataset.clone(), train_end_full, val_end);
-    let test_dataset = PartialDataset::new(arc_dataset, val_end, len);
+    let test_dataset = PartialDataset::new(arc_dataset, val_end_full, len);
 
     (train_dataset, val_dataset, test_dataset)
 }
