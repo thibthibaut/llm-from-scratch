@@ -6,9 +6,9 @@
 //!   train the GPT model.
 //! - `inspect-batch [--batch-size N] [--context-size N]`: initialize the dataloader,
 //!   generate a single batch, detokenize it and display it.
-//! - `generate-text [--prompt "..."] [--max-new-tokens N] [--artifact-dir DIR]`:
-//!   load a trained model from `DIR` (default `artifacts/`) and run inference with
-//!   argmax, displaying the top-5 next-token probabilities at each step and
+//! - `generate-text [--prompt "..."] [--max-new-tokens N] [--config-path PATH] [--model-path PATH]`:
+//!   load a trained model (default `artifacts/config.json` / `artifacts/model`) and run
+//!   inference with argmax, displaying the top-5 next-token probabilities at each step and
 //!   waiting for a key press to advance.
 
 use std::io::{self, Write};
@@ -127,7 +127,7 @@ enum Commands {
         #[arg(long, default_value_t = 128)]
         context_size: usize,
     },
-    /// Load a trained model from `--artifact-dir` and run inference on `--prompt`.
+    /// Load a trained model and run inference on `--prompt`.
     GenerateText {
         /// Prompt text used to seed the generation.
         #[arg(long, default_value = "A Hello. This is a text to transform.")]
@@ -135,9 +135,14 @@ enum Commands {
         /// Maximum number of new tokens to generate.
         #[arg(long, default_value_t = 20)]
         max_new_tokens: usize,
-        /// Directory containing the trained model artifacts (`config.json` and `model`).
-        #[arg(long, default_value = "artifacts")]
-        artifact_dir: String,
+        /// Path to the training config JSON file.
+        #[arg(long, default_value = "artifacts/config.json")]
+        config_path: String,
+        /// Path to the model record to load (no file extension — the recorder appends its
+        /// own), e.g. `artifacts/checkpoint/model-4` to load a specific epoch checkpoint
+        /// instead of a completed run's final saved model.
+        #[arg(long, default_value = "artifacts/model")]
+        model_path: String,
         /// Device to run inference on: `cpu`, `cuda` (or `cuda:N`), `mps`, `vulkan`.
         #[arg(long, default_value = "cpu", value_parser = parse_device)]
         device: LibTorchDevice,
@@ -295,17 +300,18 @@ fn run_inspect_batch(batch_size: usize, context_size: usize) {
 fn run_generate_text(
     prompt: String,
     max_new_tokens: usize,
-    artifact_dir: String,
+    config_path: String,
+    model_path: String,
     device: LibTorchDevice,
 ) {
     type MyBackend = LibTorch<f32>;
 
     // Load the saved config and trained model
-    let config = TrainingConfig::load(format!("{artifact_dir}/config.json"))
-        .expect("Config should exist for the model; run `train` first");
+    let config = TrainingConfig::load(config_path)
+        .expect("Config should exist at --config-path; run `train` first");
     let record = CompactRecorder::new()
-        .load(format!("{artifact_dir}/model").into(), &device)
-        .expect("Trained model should exist; run `train` first");
+        .load(model_path.into(), &device)
+        .expect("Trained model should exist at --model-path; run `train` first");
 
     let model: GPTModel<MyBackend> = config.model.init(&device).load_record(record);
     let context_length = config.model.embedding_config.context_size;
@@ -478,8 +484,9 @@ fn main() {
         Commands::GenerateText {
             prompt,
             max_new_tokens,
-            artifact_dir,
+            config_path,
+            model_path,
             device,
-        } => run_generate_text(prompt, max_new_tokens, artifact_dir, device),
+        } => run_generate_text(prompt, max_new_tokens, config_path, model_path, device),
     }
 }
