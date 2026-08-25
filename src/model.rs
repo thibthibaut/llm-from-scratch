@@ -128,9 +128,6 @@ pub struct MultiHeadAttention<B: Backend> {
     value_weights: Linear<B>,  // [d_model -> d_model]
     out_projection: Linear<B>, // [d_model -> d_model]
     dropout: Dropout,
-    // Causal mask so that the model cannot look into the future:
-    // Shape: [context_length, context_length], true = mask out
-    // mask: Tensor<B, 2, Bool>,
     num_heads: usize,
     head_dim: usize, // d_model / num_heads
 }
@@ -172,19 +169,12 @@ impl MultiHeadAttentionConfig {
 
         let dropout = DropoutConfig::new(self.dropout_prob).init();
 
-        // Causal mask: upper triangular, shape [context_length, context_length]
-        // true means token i CANNOT attend to token j (future)
-        // let mask = Tensor::<B, 2>::ones([self.context_length, self.context_length], device)
-        //     .tril(0) // keep diagonal and below
-        //     .bool(); // cast to Bool tensor
-
         MultiHeadAttention {
             query_weights,
             key_weights,
             value_weights,
             out_projection,
             dropout,
-            // mask,
             num_heads: self.num_heads,
             head_dim,
         }
@@ -225,16 +215,10 @@ impl<B: Backend> MultiHeadAttention<B> {
         let scale = (self.head_dim as f64).sqrt();
         let attn_scores = queries.matmul(keys.swap_dims(2, 3)) / scale;
 
+        // Apply causal mask: true values are masked out.
         let mask =
             generate_autoregressive_mask::<B>(batch_size, seq_len, &sequence.clone().device())
                 .unsqueeze_dim::<4>(1);
-
-        // Apply causal mask: true values are masked out.
-        // let mask = self
-        //     .mask
-        //     .clone()
-        //     .slice([0..seq_len, 0..seq_len]) // [SeqLen, SeqLen]
-        //     .unsqueeze::<4>(); // [1, 1, SeqLen, SeqLen] — broadcasts over B and NumHeads
 
         let masking_value: f32 = -1.0e4_f32; // f32::NEG_INFINITY
         let attn_scores = attn_scores.mask_fill(mask, masking_value);
@@ -339,9 +323,9 @@ impl<B: Backend> TransformerBlock<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::Wgpu;
+    use burn::backend::LibTorch;
 
-    type TestBackend = Wgpu<f32>;
+    type TestBackend = LibTorch<f32>;
 
     fn test_gpt_config(context_size: usize) -> GPTModelConfig {
         let embedding_config =

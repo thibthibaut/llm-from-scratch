@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
-use crate::dataset::{TextBatch, TextBatcher, load_fineweb_dataset_from_disk, split_dataset};
+use crate::dataset::{TextBatch, TextBatcher, load_default_fineweb_dataset, split_dataset};
 use crate::model::{
     EmbeddingModuleConfig, GPTModel, GPTModelConfig, MultiHeadAttentionConfig,
     TransformerBlockConfig,
@@ -27,14 +27,13 @@ use crate::training::TrainingConfig;
 
 use burn::Tensor;
 use burn::backend::Autodiff;
-use burn::backend::Wgpu;
-use burn::backend::wgpu::WgpuDevice;
+use burn::backend::LibTorch;
+use burn::backend::libtorch::LibTorchDevice;
 use burn::config::Config;
 use burn::data::dataloader::DataLoader;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::module::Module;
 use burn::optim::AdamWConfig;
-use burn::prelude::Backend;
 use burn::record::CompactRecorder;
 use burn::record::Recorder;
 use burn::tensor::Int;
@@ -45,16 +44,15 @@ mod model;
 mod tokenizer;
 mod training;
 
-const DATASET_PATH: &str = "sample_20pct.db";
 const VOCAB_PATH: &str = "vocab.json";
 
 // Default architecture parameters, tuned to fit comfortably in 6 GB on a Mac.
 // `d_model` must be divisible by `num_heads` (so head_dim = d_model / num_heads).
 const D_MODEL: usize = 128;
-const NUM_HEADS: usize = 4;
+const NUM_HEADS: usize = 8;
 const NUM_LAYERS: usize = 12;
-const CONTEXT_LENGTH: usize = 512;
-const BATCH_SIZE: usize = 16;
+const CONTEXT_LENGTH: usize = 1024;
+const BATCH_SIZE: usize = 64;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -88,6 +86,9 @@ enum Commands {
         /// Training batch size.
         #[arg(long, default_value_t = BATCH_SIZE)]
         batch_size: usize,
+        /// Device to train on: `cpu`, `cuda` (or `cuda:N`), `mps`, `vulkan`.
+        #[arg(long, default_value = "cpu", value_parser = parse_device)]
+        device: LibTorchDevice,
     },
     /// Initialize the dataloader, generate a batch, detokenize it and display it.
     InspectBatch {
@@ -109,7 +110,36 @@ enum Commands {
         /// Directory containing the trained model artifacts (`config.json` and `model`).
         #[arg(long, default_value = "artifacts")]
         artifact_dir: String,
+        /// Device to run inference on: `cpu`, `cuda` (or `cuda:N`), `mps`, `vulkan`.
+        #[arg(long, default_value = "cpu", value_parser = parse_device)]
+        device: LibTorchDevice,
     },
+}
+
+/// Parse a `--device` CLI value into a `LibTorchDevice`.
+fn parse_device(s: &str) -> Result<LibTorchDevice, String> {
+    let lower = s.to_ascii_lowercase();
+    match lower.as_str() {
+        "cpu" => Ok(LibTorchDevice::Cpu),
+        "mps" => Ok(LibTorchDevice::Mps),
+        "vulkan" => Ok(LibTorchDevice::Vulkan),
+        other => {
+            if let Some(idx) = other.strip_prefix("cuda") {
+                let idx = idx.trim_start_matches(':');
+                let index: usize = if idx.is_empty() {
+                    0
+                } else {
+                    idx.parse()
+                        .map_err(|_| format!("invalid CUDA device index in '{s}'"))?
+                };
+                Ok(LibTorchDevice::Cuda(index))
+            } else {
+                Err(format!(
+                    "unknown device '{s}': expected one of cpu, cuda[:N], mps, vulkan"
+                ))
+            }
+        }
+    }
 }
 
 /// Build the GPT model config from the given architecture parameters.
@@ -129,7 +159,7 @@ fn gpt_model_config(
 
 /// Build the tokenizer vocabulary from the dataset and write it to `vocab.json`.
 fn create_vocab() {
-    let dataset = load_fineweb_dataset_from_disk(DATASET_PATH);
+    let dataset = load_default_fineweb_dataset();
     let vocab = SimpleTokenizer::build_vocab(&dataset);
     vocab.to_file(Path::new(VOCAB_PATH));
 }
@@ -141,11 +171,11 @@ fn run_train(
     num_layers: usize,
     context_length: usize,
     batch_size: usize,
+    device: LibTorchDevice,
 ) {
-    type MyBackend = Wgpu<f32, i32>;
+    type MyBackend = LibTorch<f32>;
     type MyAutodiffBackend = Autodiff<MyBackend>;
 
-    let device = WgpuDevice::default();
     let artifact_dir = "artifacts";
 
     let tokenizer = SimpleTokenizer::from_vocab_file(Path::new(VOCAB_PATH));
@@ -162,12 +192,12 @@ fn run_train(
 
 /// Initialize the dataloader, generate a single batch, detokenize it and print it.
 fn run_inspect_batch(batch_size: usize, context_size: usize) {
-    type MyBackend = Wgpu<f32, i32>;
+    type MyBackend = LibTorch<f32>;
 
     let tokenizer = SimpleTokenizer::from_vocab_file(Path::new(VOCAB_PATH));
     let batcher = TextBatcher::new(tokenizer.clone(), context_size);
 
-    let dataset = load_fineweb_dataset_from_disk(DATASET_PATH);
+    let dataset = load_default_fineweb_dataset();
     let (train_ds, _valid_ds, _test_ds) = split_dataset(dataset);
 
     let dataloader: Arc<dyn DataLoader<MyBackend, TextBatch<MyBackend>>> =
@@ -183,8 +213,8 @@ fn run_inspect_batch(batch_size: usize, context_size: usize) {
         .expect("Dataloader should yield at least one batch");
 
     let [actual_batch_size, seq_len] = batch.inputs.dims();
-    let inputs_data = batch.inputs.into_data().to_vec::<i32>().unwrap();
-    let targets_data = batch.targets.into_data().to_vec::<i32>().unwrap();
+    let inputs_data = batch.inputs.into_data().to_vec::<i64>().unwrap();
+    let targets_data = batch.targets.into_data().to_vec::<i64>().unwrap();
 
     println!(
         "Inspected batch: actual_batch_size={}, seq_len={} (capped by context_size={})",
@@ -215,9 +245,13 @@ fn run_inspect_batch(batch_size: usize, context_size: usize) {
 /// sampling. At each step, the top-5 candidate next tokens (with their softmax
 /// probabilities) are printed and the user is prompted to press Enter to reveal
 /// the chosen next token.
-fn run_generate_text(prompt: String, max_new_tokens: usize, artifact_dir: String) {
-    type MyBackend = Wgpu<f32, i32>;
-    let device = WgpuDevice::default();
+fn run_generate_text(
+    prompt: String,
+    max_new_tokens: usize,
+    artifact_dir: String,
+    device: LibTorchDevice,
+) {
+    type MyBackend = LibTorch<f32>;
 
     // Load the saved config and trained model
     let config = TrainingConfig::load(format!("{artifact_dir}/config.json"))
@@ -252,7 +286,7 @@ fn run_generate_text(prompt: String, max_new_tokens: usize, artifact_dir: String
         let input_tokens = &tokens[start..];
 
         // Build input tensor [1, seq_len]
-        let indices: Vec<i32> = input_tokens.iter().map(|t| t.0 as i32).collect();
+        let indices: Vec<i64> = input_tokens.iter().map(|t| t.0 as i64).collect();
         let input_tensor = Tensor::<MyBackend, 1, Int>::from_data(indices.as_slice(), &device)
             .reshape([1, input_tokens.len()]);
 
@@ -373,7 +407,15 @@ fn main() {
             num_layers,
             context_length,
             batch_size,
-        } => run_train(d_model, num_heads, num_layers, context_length, batch_size),
+            device,
+        } => run_train(
+            d_model,
+            num_heads,
+            num_layers,
+            context_length,
+            batch_size,
+            device,
+        ),
         Commands::InspectBatch {
             batch_size,
             context_size,
@@ -382,6 +424,7 @@ fn main() {
             prompt,
             max_new_tokens,
             artifact_dir,
-        } => run_generate_text(prompt, max_new_tokens, artifact_dir),
+            device,
+        } => run_generate_text(prompt, max_new_tokens, artifact_dir, device),
     }
 }

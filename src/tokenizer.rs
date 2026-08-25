@@ -78,7 +78,6 @@ impl SimpleTokenizer {
     /// Build vocabulary from a dataset
     pub fn build_vocab(dataset: &SqliteDataset<TextItem>) -> Vocab {
         let num_samples = dataset.len() as u64;
-        // let num_samples = 1_000_00 as u64;
         let occurrence_counter: HashMap<String, u32> = dataset
             .iter()
             .take(num_samples as usize)

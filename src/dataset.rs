@@ -6,8 +6,8 @@ use burn::{data::dataloader::batcher::Batcher, prelude::*};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::tokenizer::{SimpleTokenizer, Tokenizer, Vocab};
-use std::collections::HashMap;
+use crate::tokenizer::Tokenizer;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -22,15 +22,26 @@ pub fn _load_gutenberg_dataset() -> SqliteDataset<TextItem> {
         .expect("Failed to load the dataset")
 }
 
-/// Load the dataset
-pub fn _load_fineweb_dataset() -> SqliteDataset<TextItem> {
-    HuggingfaceDatasetLoader::new("HuggingFaceFW/fineweb-edu")
-        .with_subset("sample-10BT")
-        .dataset("train")
-        .expect("Failed to load the dataset")
+/// Path to the cached fineweb-edu sqlite file that `burn-dataset` downloaded
+/// under `~/.cache/burn-dataset`.
+pub fn default_fineweb_dataset_path() -> PathBuf {
+    let home = std::env::var("HOME").expect("HOME environment variable must be set");
+    PathBuf::from(home)
+        .join(".cache")
+        .join("burn-dataset")
+        .join("HuggingFaceFWfineweb-edu-sample-10BT.db")
 }
+
 pub fn load_fineweb_dataset_from_disk(path: &str) -> SqliteDataset<TextItem> {
     SqliteDataset::from_db_file(path, "train").expect("Failed to load SQLite dataset")
+}
+
+/// Load the fineweb-edu dataset directly from its cached `.db` file in
+/// `~/.cache/burn-dataset`, skipping `HuggingfaceDatasetLoader`'s network/cache check.
+pub fn load_default_fineweb_dataset() -> SqliteDataset<TextItem> {
+    let path = default_fineweb_dataset_path();
+    let path = path.to_str().expect("dataset path should be valid UTF-8");
+    load_fineweb_dataset_from_disk(path)
 }
 
 /// Helper to split the dataset
@@ -45,8 +56,8 @@ pub fn split_dataset(
     let arc_dataset = Arc::new(dataset);
 
     // Define standard 80/10/10 split indices
-    let train_end = (len as f32 * 0.01) as usize;
-    let val_end = train_end + ((len as f32 * 0.001) as usize);
+    let train_end = (len as f32 * 0.8) as usize;
+    let val_end = train_end + ((len as f32 * 0.1) as usize);
 
     // Create partial datasets using slice indices
     let train_dataset = PartialDataset::new(arc_dataset.clone(), 0, train_end);
@@ -84,11 +95,11 @@ impl<T: Tokenizer + Send + Sync, B: Backend> Batcher<B, TextItem, TextBatch<B>> 
         let tokenized: Vec<Tensor<B, 1, Int>> = items
             .iter()
             .map(|item| {
-                let tokens: Vec<i32> = self
+                let tokens: Vec<i64> = self
                     .tokenizer
                     .encode(&item.text)
                     .iter()
-                    .map(|t| t.0 as i32)
+                    .map(|t| t.0 as i64)
                     .collect();
                 Tensor::<B, 1, Int>::from_data(tokens.as_slice(), device)
             })
@@ -147,10 +158,11 @@ impl<T: Tokenizer + Send + Sync, B: Backend> Batcher<B, TextItem, TextBatch<B>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tokenizer::Token;
-    use burn::backend::Wgpu;
+    use crate::tokenizer::{SimpleTokenizer, Token, Vocab};
+    use burn::backend::LibTorch;
+    use std::collections::HashMap;
 
-    type TestBackend = Wgpu<f32>;
+    type TestBackend = LibTorch<f32>;
 
     fn make_test_tokenizer() -> SimpleTokenizer {
         let mut words2tokens = HashMap::new();
@@ -221,8 +233,8 @@ mod tests {
         assert_eq!(batch.targets.dims(), [2, 1]);
 
         // Verify input/target shift: target should be input + 1
-        let input_data = batch.inputs.into_data().to_vec::<i32>().unwrap();
-        let target_data = batch.targets.into_data().to_vec::<i32>().unwrap();
+        let input_data = batch.inputs.into_data().to_vec::<i64>().unwrap();
+        let target_data = batch.targets.into_data().to_vec::<i64>().unwrap();
 
         // For text 1: input = [2] (a), target = [3] (b)  OR input = [3], target = [4] etc.
         // For text 2: input = [6] (e), target = [7] (f)
@@ -274,12 +286,12 @@ mod tests {
         assert_eq!(batch.targets.dims(), [1, 3]);
 
         // Run multiple times and check we get different slices
-        let input_data_1 = batch.inputs.into_data().to_vec::<i32>().unwrap();
+        let input_data_1 = batch.inputs.into_data().to_vec::<i64>().unwrap();
 
         let mut found_different = false;
         for _ in 0..20 {
             let batch2: TextBatch<TestBackend> = batcher.batch(items.clone(), &device);
-            let input_data_2 = batch2.inputs.into_data().to_vec::<i32>().unwrap();
+            let input_data_2 = batch2.inputs.into_data().to_vec::<i64>().unwrap();
             if input_data_1[0] != input_data_2[0] {
                 found_different = true;
                 break;
@@ -309,8 +321,8 @@ mod tests {
         assert_eq!(batch.inputs.dims(), [1, 2]);
         assert_eq!(batch.targets.dims(), [1, 2]);
 
-        let input_data = batch.inputs.into_data().to_vec::<i32>().unwrap();
-        let target_data = batch.targets.into_data().to_vec::<i32>().unwrap();
+        let input_data = batch.inputs.into_data().to_vec::<i64>().unwrap();
+        let target_data = batch.targets.into_data().to_vec::<i64>().unwrap();
 
         // Should be deterministic since there's only one possible slice
         assert_eq!(input_data, vec![2, 3]);

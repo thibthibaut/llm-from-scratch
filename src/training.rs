@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::dataset::{TextBatch, TextBatcher, load_fineweb_dataset_from_disk, split_dataset};
+use crate::dataset::{TextBatch, TextBatcher, load_default_fineweb_dataset, split_dataset};
 use crate::model::{GPTModel, GPTModelConfig};
 use crate::tokenizer::SimpleTokenizer;
 use burn::data::dataloader::DataLoaderBuilder;
@@ -71,11 +71,11 @@ impl<B: Backend> InferenceStep for GPTModel<B> {
 pub struct TrainingConfig {
     pub model: GPTModelConfig,
     pub optimizer: AdamWConfig,
-    #[config(default = 100)]
+    #[config(default = 10)]
     pub num_epochs: usize,
     #[config(default = 256)]
     pub batch_size: usize,
-    #[config(default = 4)]
+    #[config(default = 8)]
     pub num_workers: usize,
     #[config(default = 123456)]
     pub seed: u64,
@@ -85,8 +85,13 @@ pub struct TrainingConfig {
 
 fn create_artifact_dir(artifact_dir: &str) {
     // Remove existing artifacts before to get an accurate learner summary
-    std::fs::remove_dir_all(artifact_dir).ok();
-    std::fs::create_dir_all(artifact_dir).ok();
+    if let Err(err) = std::fs::remove_dir_all(artifact_dir)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        panic!("Failed to clear artifact dir '{artifact_dir}': {err}");
+    }
+    std::fs::create_dir_all(artifact_dir)
+        .unwrap_or_else(|err| panic!("Failed to create artifact dir '{artifact_dir}': {err}"));
 }
 
 pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, device: B::Device) {
@@ -101,19 +106,21 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
     let context_size = config.model.embedding_config.context_size;
     let batcher = TextBatcher::new(tokenizer, context_size);
 
-    let fine_web_dataset = load_fineweb_dataset_from_disk("sample_20pct.db");
-    let (train_ds, valid_ds, test_ds) = split_dataset(fine_web_dataset);
+    let fine_web_dataset = load_default_fineweb_dataset();
+    let (train_ds, valid_ds, _test_ds) = split_dataset(fine_web_dataset);
 
     let dataloader_train = DataLoaderBuilder::new(batcher.clone())
         .batch_size(config.batch_size)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
+        .set_device(device.clone())
         .build(train_ds);
 
     let dataloader_test = DataLoaderBuilder::new(batcher)
         .batch_size(config.batch_size)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
+        .set_device(device.clone())
         .build(valid_ds);
 
     let training = SupervisedTraining::new(artifact_dir, dataloader_train, dataloader_test)
