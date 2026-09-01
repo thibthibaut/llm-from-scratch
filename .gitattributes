@@ -1,2 +1,5 @@
 # Automatically compress the json vocab
 vocab.json filter=vocabzstd
+
+# The trained BPE tokenizer, same treatment as the word-level vocab above.
+tokenizer.json filter=vocabzstd

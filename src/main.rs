@@ -1,7 +1,11 @@
 //! Command-line entry point for the llm-from-scratch project.
 //!
 //! Subcommands:
-//! - `create-vocab`: build the tokenizer vocabulary from the dataset and write it to `vocab.json`.
+//! - `create-vocab`: build the legacy word-level vocabulary from the dataset and write it to
+//!   `vocab.json`.
+//! - `train-tokenizer [--vocab-size N] [--num-docs N] [--min-frequency N] [--output PATH]`:
+//!   train a byte-level BPE tokenizer on the dataset's train split and write it to
+//!   `tokenizer.json`.
 //! - `train [--d-model N] [--num-heads N] [--num-layers N] [--context-length N] [--batch-size N]`:
 //!   train the GPT model.
 //! - `inspect-batch [--batch-size N] [--context-size N]`: initialize the dataloader,
@@ -22,7 +26,7 @@ use crate::model::{
     EmbeddingModuleConfig, GPTModel, GPTModelConfig, MultiHeadAttentionConfig,
     TransformerBlockConfig,
 };
-use crate::tokenizer::{SimpleTokenizer, Token, Tokenizer};
+use crate::tokenizer::{BpeTokenizer, SimpleTokenizer, Token, Tokenizer};
 use crate::training::TrainingConfig;
 
 use burn::Tensor;
@@ -31,6 +35,7 @@ use burn::backend::LibTorch;
 use burn::backend::libtorch::LibTorchDevice;
 use burn::config::Config;
 use burn::data::dataloader::DataLoader;
+use burn::data::dataloader::Dataset;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::module::Module;
 use burn::optim::AdamWConfig;
@@ -45,6 +50,19 @@ mod tokenizer;
 mod training;
 
 const VOCAB_PATH: &str = "vocab.json";
+const TOKENIZER_PATH: &str = "tokenizer.json";
+
+// Defaults for `train-tokenizer`.
+// A power of two, and small enough that the (untied) embedding + output head stay a sane
+// fraction of a 124M-param model: 32768 * 768 * 2 = 50M params of pure lookup table.
+const TOKENIZER_VOCAB_SIZE: usize = 32_768;
+// Number of *documents* from the train split to fit the merges on. fineweb-edu documents
+// average a few KB, so this is on the order of 10^8-10^9 characters — plenty for a 32k
+// vocabulary, and the point past which more data stops moving the merge table.
+const TOKENIZER_NUM_DOCS: usize = 100_000;
+// Drop merges seen fewer than this many times, so one-off noise in the corpus (mojibake,
+// base64 blobs, repeated boilerplate hashes) doesn't win vocabulary slots.
+const TOKENIZER_MIN_FREQUENCY: u64 = 2;
 
 // Default architecture parameters, tuned to fit comfortably in 6 GB on a Mac.
 // `d_model` must be divisible by `num_heads` (so head_dim = d_model / num_heads).
@@ -79,8 +97,25 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Build the tokenizer vocabulary from the dataset and write it to `vocab.json`.
+    /// Build the legacy word-level vocabulary from the dataset and write it to `vocab.json`.
     CreateVocab,
+    /// Train a byte-level BPE tokenizer on the dataset and write it to `tokenizer.json`.
+    TrainTokenizer {
+        /// Target vocabulary size, including the 256 byte tokens and `<|endoftext|>`.
+        #[arg(long, default_value_t = TOKENIZER_VOCAB_SIZE)]
+        vocab_size: usize,
+        /// Number of documents from the train split to fit the merges on. The trainer holds
+        /// the whole word-frequency table in RAM, so this is the knob to turn down if you run
+        /// out of memory — not `--vocab-size`.
+        #[arg(long, default_value_t = TOKENIZER_NUM_DOCS)]
+        num_docs: usize,
+        /// Ignore merge candidates occurring fewer than this many times in the sample.
+        #[arg(long, default_value_t = TOKENIZER_MIN_FREQUENCY)]
+        min_frequency: u64,
+        /// Where to write the trained tokenizer.
+        #[arg(long, default_value = TOKENIZER_PATH)]
+        output: String,
+    },
     /// Train the GPT model.
     Train {
         /// Embedding dimension (must be divisible by `num-heads`).
@@ -195,6 +230,59 @@ fn create_vocab() {
     let dataset = load_default_fineweb_dataset();
     let vocab = SimpleTokenizer::build_vocab(&dataset);
     vocab.to_file(Path::new(VOCAB_PATH));
+}
+
+/// Train a byte-level BPE tokenizer on the dataset and write it to `output`.
+fn train_tokenizer(vocab_size: usize, num_docs: usize, min_frequency: u64, output: &str) {
+    let dataset = load_default_fineweb_dataset();
+
+    // Fit the merges on the *train* split only. The tokenizer is part of the model: letting it
+    // see validation/test documents leaks those into every downstream eval, because the merge
+    // table is then shaped by text the model is later scored on.
+    let (train, valid, _test) = split_dataset(dataset, None, None);
+
+    let num_docs = num_docs.min(train.len());
+    println!(
+        "Training a byte-level BPE tokenizer: vocab_size={vocab_size}, \
+         min_frequency={min_frequency}, {num_docs} documents from the train split"
+    );
+
+    // Sample with a stride across the whole train split rather than taking the first N rows.
+    // fineweb-edu is stored roughly in crawl order, so a contiguous prefix is a biased slice of
+    // the corpus (a handful of dumps, and whatever sites dominate them) and would bake that
+    // bias into the merge table. Striding costs random-access seeks instead of a sequential
+    // scan, which is the slow part of this command on a network volume — but it only happens
+    // once, and the merge table it produces is the one you keep.
+    let stride = (train.len() / num_docs).max(1);
+    let texts = (0..num_docs).map(move |i| {
+        train
+            .get(i * stride)
+            .expect("strided index stays within the train split")
+            .text
+    });
+    let tokenizer = BpeTokenizer::train(texts, vocab_size, min_frequency);
+
+    let path = Path::new(output);
+    tokenizer.to_file(path);
+    println!(
+        "Wrote {} ({} tokens, <|endoftext|> = {})",
+        path.display(),
+        tokenizer.get_vocab_size(),
+        tokenizer.end_of_text().0
+    );
+
+    // Score it on held-out documents the merges were never fitted on. This is the number to
+    // compare against a pretrained tokenizer, or against another --vocab-size.
+    let sample: Vec<String> = (0..1_000.min(valid.len()))
+        .map(|i| valid.get(i).expect("index is within the valid split").text)
+        .collect();
+    if !sample.is_empty() {
+        println!(
+            "Held-out compression: {:.3} bytes/token over {} validation documents",
+            tokenizer.bytes_per_token(sample.iter().map(String::as_str)),
+            sample.len()
+        );
+    }
 }
 
 /// Train the GPT model with the given architecture and training parameters.
@@ -371,7 +459,9 @@ fn run_generate_text(
         println!("--- Step {} ---", step + 1);
         println!("Top 5 candidate next tokens:");
         for (rank, (token_id, prob)) in top5.iter().enumerate() {
-            let word = &tokenizer.vocab.tokens2words[*token_id];
+            let word = tokenizer
+                .token_to_piece(Token(*token_id as u32))
+                .unwrap_or_else(|| "<invalid id>".to_string());
             println!(
                 "  #{}: \"{}\" (id={}, prob={:.4})",
                 rank + 1,
@@ -434,14 +524,19 @@ fn run_generate_text(
         let label = if choice == 1 { "default" } else { "user pick" };
         println!(
             "Chosen: \"{}\" (id={}, #{}) [{}]",
-            tokenizer.vocab.tokens2words[best_idx], best_idx, choice, label
+            tokenizer
+                .token_to_piece(next_token)
+                .unwrap_or_else(|| "<invalid id>".to_string()),
+            best_idx,
+            choice,
+            label
         );
         println!("Text so far: {}", tokenizer.decode(&tokens));
         println!();
 
         // Stop at EOT
-        if next_token.0 == Token::END_OF_TEXT.0 {
-            println!("Reached <EOT>, stopping.");
+        if next_token == tokenizer.end_of_text() {
+            println!("Reached end-of-text, stopping.");
             break;
         }
     }
@@ -454,6 +549,12 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::CreateVocab => create_vocab(),
+        Commands::TrainTokenizer {
+            vocab_size,
+            num_docs,
+            min_frequency,
+            output,
+        } => train_tokenizer(vocab_size, num_docs, min_frequency, &output),
         Commands::Train {
             d_model,
             num_heads,

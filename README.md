@@ -5,6 +5,42 @@ Work in progress.
 A small GPT model written from scratch in Rust using [burn](https://burn.dev), with the
 `tch` (LibTorch) backend for CUDA training.
 
+## Tokenizer
+
+Two implementations live behind the `Tokenizer` trait in `src/tokenizer.rs`:
+
+- `SimpleTokenizer` — the original word-level tokenizer, built by `create-vocab` into
+  `vocab.json`. It is **lossy**: it lowercases, drops all whitespace, drops every non-ASCII
+  byte, splits numbers into single digits, has no token for symbols outside
+  `[.,!?;:'"()]`, and maps everything past the top-32k words to `<UNK>`.
+- `BpeTokenizer` — a byte-level BPE tokenizer backed by the `tokenizers` crate, built by
+  `train-tokenizer` into `tokenizer.json`. It is **lossless**: `decode(encode(x)) == x` for
+  any input, and it has no `<UNK>` at all, because the trainer is seeded with all 256
+  byte-level characters so every possible byte has a token.
+
+Train one:
+
+```bash
+cargo run --release -- train-tokenizer \
+  --vocab-size 32768 \
+  --num-docs 100000 \
+  --min-frequency 2 \
+  --output tokenizer.json
+```
+
+The merges are fitted on a strided sample of the **train split only** — letting the tokenizer
+see validation or test documents would leak them into every downstream eval. The command
+prints held-out bytes-per-token at the end; that number is how you compare two `--vocab-size`
+settings, or compare against a pretrained `tokenizer.json` from the HuggingFace Hub (which
+`BpeTokenizer::from_file` loads just as happily).
+
+`--num-docs` is the memory knob, not `--vocab-size`: the trainer holds the word-frequency
+table for the whole sample in RAM before it starts merging.
+
+Note that the two tokenizers are not interchangeable for an already-trained model — switching
+changes `vocab_size`, which changes the shape of the embedding and output head, so it
+invalidates existing checkpoints under `artifacts/`.
+
 ## GPU training setup (RunPod, or any bare CUDA box)
 
 Notes from getting this running on a rented RunPod pod, kept here so a Dockerfile can be
@@ -18,8 +54,8 @@ apt-get install -y zstd unzip pkg-config llvm build-essential
 ```
 
 - `zstd` — decompresses the dataset transfer, and is also required by the git smudge/clean
-  filter that keeps `vocab.json` compressed in the repo (see `.gitattributes`,
-  `compress-vocab`, `decompress-vocab`).
+  filter that keeps `vocab.json` and `tokenizer.json` compressed in the repo (see
+  `.gitattributes`, `compress-vocab`, `decompress-vocab`).
 - `unzip`, `pkg-config` — precautionary; `torch-sys`'s `download-libtorch` build script and
   its dependencies may shell out to these.
 - `llvm` — pulled in after a `rust-lld` crash (`Bus error`, signal 7) while linking

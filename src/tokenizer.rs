@@ -6,9 +6,13 @@ use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs::File, io::BufWriter, path::Path, sync::LazyLock};
+use tokenizers::models::TrainerWrapper;
+use tokenizers::models::bpe::{BPE, BpeTrainerBuilder};
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
 
 /// Token type
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Token(pub u32);
 impl Token {
     // Define some special tokens
@@ -41,6 +45,20 @@ pub trait Tokenizer {
     fn encode(&self, text: &str) -> Vec<Token>;
     fn decode(&self, tokens: &[Token]) -> String;
     fn get_vocab_size(&self) -> usize;
+
+    /// The end-of-text token for *this* tokenizer.
+    ///
+    /// Not a constant: a trained BPE tokenizer assigns special-token ids at training time, so
+    /// the generation loop has to ask the tokenizer rather than compare against a hardcoded id.
+    fn end_of_text(&self) -> Token;
+
+    /// The surface string a single token stands for, for inspection/debugging (top-k candidate
+    /// listings and the like). Returns `None` for ids outside the vocabulary.
+    ///
+    /// This is *not* `decode` on a one-element slice: for a byte-level BPE tokenizer the piece
+    /// is the byte-level-escaped form (`"\u{c4}\u{a0}the"`), which is exactly what you want when
+    /// showing which token the model picked, and is not necessarily valid standalone text.
+    fn token_to_piece(&self, token: Token) -> Option<String>;
 }
 
 #[derive(Debug, Clone)]
@@ -163,5 +181,262 @@ impl Tokenizer for SimpleTokenizer {
 
     fn get_vocab_size(&self) -> usize {
         self.vocab.tokens2words.len()
+    }
+
+    fn end_of_text(&self) -> Token {
+        Token::END_OF_TEXT
+    }
+
+    fn token_to_piece(&self, token: Token) -> Option<String> {
+        self.vocab.tokens2words.get(token.0 as usize).cloned()
+    }
+}
+
+// ----------- BYTE-LEVEL BPE TOKENIZER ----------------------------------------
+//
+// Backed by HuggingFace's `tokenizers` crate. Unlike `SimpleTokenizer` this is *lossless*:
+// `decode(encode(x)) == x` for any input, including case, whitespace, punctuation the regex
+// never covered (`-`, `/`, `=`, `$`, `{`, ...) and non-ASCII bytes. It also has no `<UNK>`,
+// because the trainer is seeded with all 256 byte-level characters (see `train`), so every
+// possible input byte is representable.
+
+/// The single special token in a trained vocabulary: the document separator, also used as the
+/// stop signal in the generation loop.
+///
+/// Deliberately *not* a CLI flag. Special tokens are a contract between the tokenizer and the
+/// model code (`Tokenizer::end_of_text`, the generation loop's stop condition), not a tuning
+/// knob — a flag would let you produce a tokenizer whose special tokens the rest of the
+/// codebase doesn't know about. Its *id* is not hardcoded: it's read back from the trained
+/// tokenizer via `end_of_text`.
+pub const END_OF_TEXT_PIECE: &str = "<|endoftext|>";
+
+/// Byte-level BPE tokenizer, either trained by `BpeTokenizer::train` or loaded from a
+/// `tokenizer.json` (ours, or a pretrained one downloaded from the HuggingFace Hub).
+#[derive(Debug, Clone)]
+pub struct BpeTokenizer {
+    inner: HfTokenizer,
+    end_of_text: Token,
+}
+
+impl BpeTokenizer {
+    fn wrap(inner: HfTokenizer) -> Self {
+        let end_of_text = inner
+            .token_to_id(END_OF_TEXT_PIECE)
+            .map(Token)
+            .unwrap_or_else(|| {
+                panic!("tokenizer has no `{END_OF_TEXT_PIECE}` token; the model needs one to know when to stop")
+            });
+        Self { inner, end_of_text }
+    }
+
+    /// Load a tokenizer from a `tokenizer.json`.
+    // Exercised by the tests; unused in the binary until `train`/`generate-text` are switched
+    // over from `SimpleTokenizer` (which invalidates the existing checkpoints under artifacts/).
+    #[allow(dead_code)]
+    pub fn from_file(path: &Path) -> Self {
+        let inner = HfTokenizer::from_file(path)
+            .unwrap_or_else(|e| panic!("failed to load tokenizer from {}: {e}", path.display()));
+        Self::wrap(inner)
+    }
+
+    /// Save this tokenizer to a `tokenizer.json`.
+    pub fn to_file(&self, path: &Path) {
+        self.inner
+            .save(path, true)
+            .unwrap_or_else(|e| panic!("failed to write tokenizer to {}: {e}", path.display()));
+    }
+
+    /// Train a byte-level BPE tokenizer over `texts`.
+    ///
+    /// `min_frequency` drops merges seen fewer than that many times, which keeps one-off noise
+    /// (mojibake, base64 blobs, boilerplate hashes — fineweb-edu has plenty) out of the merge
+    /// table.
+    ///
+    /// Memory: the trainer holds the word-frequency table for the *entire* input in RAM before
+    /// it starts merging, so peak usage scales with the number of distinct pre-tokens in
+    /// `texts`, not with the merge count. Cap the input rather than the vocab if you run out.
+    pub fn train<I>(texts: I, vocab_size: usize, min_frequency: u64) -> Self
+    where
+        I: Iterator<Item = String> + Send,
+    {
+        // `add_prefix_space: false` matches GPT-2: a leading space is part of the *following*
+        // token ("the" and " the" are distinct), and nothing is injected at the start of input.
+        let byte_level = ByteLevel::default().add_prefix_space(false);
+
+        let mut trainer: TrainerWrapper = BpeTrainerBuilder::new()
+            .vocab_size(vocab_size)
+            .min_frequency(min_frequency)
+            .show_progress(true)
+            .special_tokens(vec![AddedToken::from(END_OF_TEXT_PIECE, true)])
+            // Seed the vocabulary with all 256 byte-level characters. This is what makes the
+            // tokenizer total: every byte has a token, so no input can ever produce an <UNK>,
+            // no matter how little of it the training sample saw.
+            .initial_alphabet(ByteLevel::alphabet().into_iter().collect())
+            .build()
+            .into();
+
+        let mut inner = HfTokenizer::new(BPE::default());
+        inner.with_pre_tokenizer(Some(byte_level));
+        inner.with_decoder(Some(byte_level));
+        inner.with_post_processor(Some(byte_level));
+
+        inner
+            .train(&mut trainer, texts)
+            .unwrap_or_else(|e| panic!("BPE training failed: {e}"));
+
+        Self::wrap(inner)
+    }
+
+    /// Average bytes of source text encoded per token, over `texts`.
+    ///
+    /// The metric to compare tokenizers on: higher means the same context window holds more
+    /// text, and the same corpus costs fewer training steps. Compare two candidates on a slice
+    /// the tokenizer was *not* trained on.
+    pub fn bytes_per_token<'a, I>(&self, texts: I) -> f64
+    where
+        I: Iterator<Item = &'a str>,
+    {
+        let (bytes, tokens) = texts.fold((0usize, 0usize), |(b, t), text| {
+            (b + text.len(), t + self.encode(text).len())
+        });
+        if tokens == 0 {
+            0.0
+        } else {
+            bytes as f64 / tokens as f64
+        }
+    }
+}
+
+impl Tokenizer for BpeTokenizer {
+    fn encode(&self, text: &str) -> Vec<Token> {
+        self.inner
+            .encode(text, false)
+            .unwrap_or_else(|e| panic!("failed to encode text: {e}"))
+            .get_ids()
+            .iter()
+            .map(|id| Token(*id))
+            .collect()
+    }
+
+    fn decode(&self, tokens: &[Token]) -> String {
+        let ids: Vec<u32> = tokens.iter().map(|t| t.0).collect();
+        // `skip_special_tokens: false` — when inspecting generation we want to *see* that the
+        // model emitted <|endoftext|>, not have it silently disappear.
+        self.inner
+            .decode(&ids, false)
+            .unwrap_or_else(|e| panic!("failed to decode tokens: {e}"))
+    }
+
+    fn get_vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+
+    fn end_of_text(&self) -> Token {
+        self.end_of_text
+    }
+
+    fn token_to_piece(&self, token: Token) -> Option<String> {
+        self.inner.id_to_token(token.0)
+    }
+}
+
+// ----------- TESTS -----------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A corpus with enough repetition for BPE to find real merges.
+    fn corpus() -> Vec<String> {
+        let sentences = [
+            "The quick brown fox jumps over the lazy dog.",
+            "Education is the most powerful weapon which you can use to change the world.",
+            "Photosynthesis converts light energy into chemical energy in plants.",
+            "The mitochondria is the powerhouse of the cell, as every student learns.",
+        ];
+        sentences
+            .iter()
+            .cycle()
+            .take(400)
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn tiny_tokenizer() -> BpeTokenizer {
+        BpeTokenizer::train(corpus().into_iter(), 500, 2)
+    }
+
+    #[test]
+    fn round_trip_is_lossless() {
+        let tokenizer = tiny_tokenizer();
+        // Case, runs of whitespace, punctuation the old regex dropped, and non-ASCII — all of
+        // which `SimpleTokenizer` silently destroys.
+        for text in [
+            "The quick brown fox jumps over the lazy dog.",
+            "MiXeD CaSe  with   irregular\tspacing\nand newlines",
+            "symbols the old regex dropped: - / = % $ [ ] { } # @ ~ ^ * + < > |",
+            "non-ascii: café, naïve, 日本語, emoji 🚀, em—dash",
+            "let x: Vec<u32> = (0..10).map(|i| i * 2).collect();",
+        ] {
+            assert_eq!(tokenizer.decode(&tokenizer.encode(text)), text);
+        }
+    }
+
+    #[test]
+    fn every_byte_is_representable() {
+        // The byte-level initial alphabet means there is no such thing as an unknown token,
+        // even for text sharing nothing with the training corpus.
+        let tokenizer = tiny_tokenizer();
+        let text = "ЖЖЖ ᚠᚡᚢ \u{0}\u{1}\u{7f} ⣿⣿";
+        let tokens = tokenizer.encode(text);
+        assert!(!tokens.is_empty());
+        assert_eq!(tokenizer.decode(&tokens), text);
+    }
+
+    #[test]
+    fn learns_merges_beyond_the_byte_alphabet() {
+        let tokenizer = tiny_tokenizer();
+        // 256 byte tokens + <|endoftext|> is the floor; anything above that is learned merges.
+        assert!(tokenizer.get_vocab_size() > 257);
+        // Frequent whole words should have collapsed into single tokens.
+        assert_eq!(tokenizer.encode("The").len(), 1);
+        assert_eq!(tokenizer.encode(" energy").len(), 1);
+    }
+
+    #[test]
+    fn end_of_text_is_read_from_the_tokenizer() {
+        let tokenizer = tiny_tokenizer();
+        let eot = tokenizer.end_of_text();
+        assert_eq!(
+            tokenizer.token_to_piece(eot).as_deref(),
+            Some(END_OF_TEXT_PIECE)
+        );
+        // Special tokens are added first, so the id happens to be 0 here — but nothing in the
+        // codebase may assume that, which is why it goes through `end_of_text()`.
+        assert_eq!(tokenizer.encode(END_OF_TEXT_PIECE), vec![eot]);
+    }
+
+    #[test]
+    fn survives_a_save_load_round_trip() {
+        let tokenizer = tiny_tokenizer();
+        let path = std::env::temp_dir().join(format!(
+            "llm-from-scratch-tokenizer-{}.json",
+            std::process::id()
+        ));
+        tokenizer.to_file(&path);
+
+        let loaded = BpeTokenizer::from_file(&path);
+        let text = "The quick brown fox — café 🚀";
+        assert_eq!(loaded.encode(text), tokenizer.encode(text));
+        assert_eq!(loaded.end_of_text().0, tokenizer.end_of_text().0);
+        assert_eq!(loaded.get_vocab_size(), tokenizer.get_vocab_size());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn compresses_better_than_one_byte_per_token() {
+        let tokenizer = tiny_tokenizer();
+        let held_out = ["The lazy dog learns about energy in the world."];
+        assert!(tokenizer.bytes_per_token(held_out.into_iter()) > 2.0);
     }
 }
