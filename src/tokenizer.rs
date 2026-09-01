@@ -546,39 +546,3 @@ impl Tokenizer for AnyTokenizer {
         }
     }
 }
-
-#[cfg(test)]
-mod cu_bench {
-    use super::*;
-    use std::time::Instant;
-
-    #[test]
-    fn encode_throughput() {
-        let dir = std::env::var("BENCH_DIR").expect("set BENCH_DIR");
-        let raw = std::fs::read_to_string(format!("{dir}/bench_docs.json")).unwrap();
-        let docs: Vec<String> = serde_json::from_str(&raw).unwrap();
-        let bytes: usize = docs.iter().map(String::len).sum();
-
-        let tok = BpeTokenizer::from_file(Path::new("tokenizer.json"));
-        // warm up
-        for d in docs.iter().take(50) {
-            let _ = tok.encode(d);
-        }
-
-        let mut best = f64::MAX;
-        for _ in 0..5 {
-            let t = Instant::now();
-            let n: usize = docs.iter().map(|d| tok.encode(d).len()).sum();
-            let secs = t.elapsed().as_secs_f64();
-            std::hint::black_box(n);
-            best = best.min(secs);
-        }
-        println!(
-            "RESULT docs={} bytes={} best={:.3}s throughput={:.2} MB/s",
-            docs.len(),
-            bytes,
-            best,
-            (bytes as f64 / 1e6) / best
-        );
-    }
-}
