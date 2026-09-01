@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use crate::dataset::{TextBatch, TextBatcher, TextItem, load_default_fineweb_dataset, split_dataset};
+use crate::dataset::{
+    TextBatch, TextBatcher, TextItem, documents_per_batch, load_default_fineweb_dataset,
+    split_dataset,
+};
 use crate::model::{GPTModel, GPTModelConfig};
 use crate::tokenizer::{AnyTokenizer, Tokenizer, TokenizerKind};
 use burn::data::dataloader::DataLoaderBuilder;
@@ -145,17 +148,27 @@ pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
     B::seed(&device, config.seed);
 
     let context_size = config.model.embedding_config.context_size;
-    let batcher = TextBatcher::new(tokenizer, context_size);
+    let batcher = TextBatcher::new(tokenizer, context_size, config.batch_size);
+
+    // The dataloader's batch size is a number of *documents*, not of training sequences. The
+    // batcher packs that pool of documents into one flat token stream and cuts
+    // `config.batch_size` sequences out of it, so what it needs from the dataloader is a token
+    // budget. See `documents_per_batch`.
+    let docs_per_batch = documents_per_batch(config.batch_size, context_size);
+    println!(
+        "Batching: {} sequences x {} tokens per step, packed from a document pool of {}",
+        config.batch_size, context_size, docs_per_batch
+    );
 
     let dataloader_train = DataLoaderBuilder::new(batcher.clone())
-        .batch_size(config.batch_size)
+        .batch_size(docs_per_batch)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
         .set_device(device.clone())
         .build(train_dataset);
 
     let dataloader_test = DataLoaderBuilder::new(batcher)
-        .batch_size(config.batch_size)
+        .batch_size(docs_per_batch)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
         .set_device(device.clone())

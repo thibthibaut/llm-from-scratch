@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
-use crate::dataset::{TextBatch, TextBatcher, load_default_fineweb_dataset, split_dataset};
+use crate::dataset::{
+    TextBatch, TextBatcher, documents_per_batch, load_default_fineweb_dataset, split_dataset,
+};
 use crate::model::{
     EmbeddingModuleConfig, GPTModel, GPTModelConfig, MultiHeadAttentionConfig,
     TransformerBlockConfig,
@@ -374,14 +376,20 @@ fn run_inspect_batch(
     type MyBackend = LibTorch<f32>;
 
     let (tokenizer, _) = load_tokenizer(tokenizer_kind, tokenizer_path);
-    let batcher = TextBatcher::new(tokenizer.clone(), context_size);
+    let batcher = TextBatcher::new(tokenizer.clone(), context_size, batch_size);
 
     let dataset = load_default_fineweb_dataset();
     let (train_ds, _valid_ds, _test_ds) = split_dataset(dataset, None, None);
 
+    // Documents per call, not sequences per batch — see `documents_per_batch`.
+    let docs_per_batch = documents_per_batch(batch_size, context_size);
+    println!(
+        "Batching: {batch_size} sequences x {context_size} tokens, packed from a pool of {docs_per_batch}"
+    );
+
     let dataloader: Arc<dyn DataLoader<MyBackend, TextBatch<MyBackend>>> =
         DataLoaderBuilder::new(batcher)
-            .batch_size(batch_size)
+            .batch_size(docs_per_batch)
             .shuffle(42)
             .num_workers(1)
             .build(train_ds);
