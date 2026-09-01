@@ -48,11 +48,18 @@ pub fn load_default_fineweb_dataset() -> SqliteDataset<TextItem> {
 /// `max_train_items`/`max_valid_items` optionally cap the size of the train/validation splits
 /// (taking each one's first N items) without moving the underlying 80/10/10 boundaries — the
 /// test split's start point is always the true (uncapped) validation end, so it stays fixed
-/// and non-overlapping regardless of capping. Burn's checkpointing strategy only fires at
-/// epoch boundaries, so a full-corpus epoch (and full-corpus validation pass) on a dataset this
-/// size means waiting days for the first checkpoint; capping both to a smaller slice makes
-/// epochs (and therefore checkpoints) land at a practical cadence. The tradeoff: within a
-/// single run, every epoch reuses the same capped slices rather than sweeping fresh data.
+/// and non-overlapping regardless of capping.
+///
+/// The caps are in *documents*, which is what a split is made of. The `train` command takes its
+/// `--epoch-size`/`--valid-size` in batches instead — a batch being one optimizer step, which is
+/// the unit checkpoint cadence is measured in — and multiplies by `documents_per_batch` to get
+/// the numbers passed here.
+///
+/// Burn's checkpointing strategy only fires at epoch boundaries, so a full-corpus epoch (and
+/// full-corpus validation pass) on a dataset this size means waiting days for the first
+/// checkpoint; capping both to a smaller slice makes epochs (and therefore checkpoints) land at
+/// a practical cadence. The tradeoff: within a single run, every epoch reuses the same capped
+/// slices rather than sweeping fresh data.
 pub fn split_dataset(
     dataset: SqliteDataset<TextItem>,
     max_train_items: Option<usize>,

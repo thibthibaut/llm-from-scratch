@@ -75,13 +75,14 @@ const NUM_LAYERS: usize = 12;
 const CONTEXT_LENGTH: usize = 1024;
 const BATCH_SIZE: usize = 64;
 // Burn's checkpointing strategy only fires at epoch boundaries, so a full-corpus epoch on a
-// multi-million-row dataset means waiting days for the first checkpoint. Cap the train split
-// so an epoch finishes in minutes instead; see `split_dataset` for the tradeoff this makes.
-const EPOCH_SIZE: usize = 24_000;
+// multi-million-row dataset means waiting days for the first checkpoint. Cap the epoch to a
+// fixed number of optimizer steps instead; see `split_dataset` for the tradeoff this makes.
+// 300 steps at the default batch size is ~19.7M tokens, i.e. a checkpoint every few minutes.
+const EPOCH_BATCHES: usize = 300;
 // Validation runs every epoch too, so it needs the same kind of cap — otherwise it's the full
 // (uncapped) 10% validation split running against a training epoch that's now a small slice of
-// the corpus. Matches EPOCH_SIZE's original 80/10 train/valid ratio.
-const VALID_SIZE: usize = 2_400;
+// the corpus. Keeps EPOCH_BATCHES' 10:1 train/valid ratio.
+const VALID_BATCHES: usize = 30;
 // High ceiling; in practice runs are stopped manually once the checkpointed loss looks good,
 // relying on burn-train's default keep-best-by-validation-loss checkpointing strategy.
 const NUM_EPOCHS: usize = 200;
@@ -139,15 +140,16 @@ enum Commands {
         /// Device to train on: `cpu`, `cuda` (or `cuda:N`), `mps`, `vulkan`.
         #[arg(long, default_value = "cpu", value_parser = parse_device)]
         device: LibTorchDevice,
-        /// Cap the train split to this many items, so an epoch (and therefore a checkpoint,
-        /// since burn-train only checkpoints at epoch boundaries) lands at a practical
-        /// cadence instead of requiring a full sweep of the dataset. 0 disables the cap.
-        #[arg(long, default_value_t = EPOCH_SIZE)]
+        /// Number of batches (optimizer steps) in one epoch, so an epoch — and therefore a
+        /// checkpoint, since burn-train only checkpoints at epoch boundaries — lands at a
+        /// practical cadence instead of requiring a full sweep of the dataset. Each batch is
+        /// `--batch-size * --context-length` tokens. 0 means a full pass over the train split.
+        #[arg(long, default_value_t = EPOCH_BATCHES)]
         epoch_size: usize,
-        /// Cap the validation split to this many items — runs every epoch, so it needs the
-        /// same kind of cap as --epoch-size or it dwarfs a capped training epoch. 0 disables
-        /// the cap.
-        #[arg(long, default_value_t = VALID_SIZE)]
+        /// Number of batches in the validation pass, which runs every epoch and so needs the
+        /// same kind of cap as --epoch-size or it dwarfs a capped training epoch. 0 means a
+        /// full pass over the validation split.
+        #[arg(long, default_value_t = VALID_BATCHES)]
         valid_size: usize,
         /// Number of epochs (bounded train-split passes) before training stops on its own.
         #[arg(long, default_value_t = NUM_EPOCHS)]
@@ -341,16 +343,32 @@ fn run_train(
     drop(tokenizer);
 
     let gpt_config = gpt_model_config(vocab_size, context_length, d_model, num_heads, num_layers);
-    let max_train_items = if epoch_size == 0 {
-        None
-    } else {
-        Some(epoch_size)
+
+    // `--epoch-size` and `--valid-size` are counts of *batches*, because a batch is one
+    // optimizer step and that is the unit the checkpoint cadence is actually measured in.
+    // `split_dataset` caps by document, though, so convert: the dataloader hands the batcher
+    // `documents_per_batch` documents per batch, and that pool size already accounts for
+    // `--batch-size` and `--context-length`. Note the consequence of counting steps rather than
+    // documents — halving `--batch-size` now halves the tokens an epoch sees, where capping by
+    // document held tokens-per-epoch roughly fixed and doubled the step count instead.
+    let docs_per_batch = documents_per_batch(batch_size, context_length);
+    let batches_to_items = |batches: usize| {
+        if batches == 0 {
+            None
+        } else {
+            Some(batches * docs_per_batch)
+        }
     };
-    let max_valid_items = if valid_size == 0 {
-        None
-    } else {
-        Some(valid_size)
-    };
+    let max_train_items = batches_to_items(epoch_size);
+    let max_valid_items = batches_to_items(valid_size);
+
+    if let (Some(train_items), Some(valid_items)) = (max_train_items, max_valid_items) {
+        println!(
+            "Epoch: {epoch_size} batches ({train_items} documents, {} tokens), \
+             validation: {valid_size} batches ({valid_items} documents)",
+            epoch_size * batch_size * context_length
+        );
+    }
 
     crate::training::train_from_disk::<MyAutodiffBackend>(
         artifact_dir,

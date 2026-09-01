@@ -246,6 +246,7 @@ impl<B: Backend> MultiHeadAttention<B> {
 
 // ---------- TransformerBlock
 
+/// A pre-norm transformer block: attention and MLP sublayers, each wrapped in a residual.
 #[derive(Module, Debug)]
 pub struct TransformerBlock<B: Backend> {
     layer_norm1: LayerNorm<B>,
@@ -297,7 +298,7 @@ impl<B: Backend> TransformerBlock<B> {
         // Self attention
         let x = self.mha.forward(x);
 
-        let x = self.dropout1.forward(x);
+        // let x = self.dropout1.forward(x);
 
         // Ad the resudual
         let x = x + shortcut;
@@ -312,8 +313,7 @@ impl<B: Backend> TransformerBlock<B> {
         let x = self.activation.forward(x);
         let x = self.linear2.forward(x);
 
-        // Dropout
-        let x = self.dropout2.forward(x);
+        // let x = self.dropout2.forward(x);
 
         // Add the residual
         x + shortcut
