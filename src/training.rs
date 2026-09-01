@@ -40,7 +40,7 @@ impl<B: Backend> GPTModel<B> {
 
         // Compute predictions: argmax over vocab dimension
         // argmax returns [batch_size, seq_len, 1], squeeze to [batch_size, seq_len]
-        let predictions = logits.argmax(2).squeeze::<2>();
+        let predictions = logits.clone().argmax(2).squeeze::<2>();
 
         SequenceOutput {
             loss,
