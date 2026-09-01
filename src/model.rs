@@ -115,7 +115,8 @@ impl<B: Backend> EmbeddingModule<B> {
         let positions = positions.expand([batch_size, sequence_length]);
         // Add the two embeddings
         let x = self.token_embedding.forward(indices) + self.position_embedding.forward(positions);
-        self.dropout.forward(x)
+        x
+        // self.dropout.forward(x)
     }
 }
 
@@ -226,7 +227,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         // Softmax over last dim (the key dimension)
         let attn_weights = activation::softmax(attn_scores, 3); // dim=3 = SeqLen of keys
         // Apply dropout
-        let attn_weights = self.dropout.forward(attn_weights);
+        // let attn_weights = self.dropout.forward(attn_weights);
 
         // attn_weights @ V : [B, NumHeads, SeqLen, SeqLen] @ [B, NumHeads, SeqLen, HeadDim]
         //                  = [B, NumHeads, SeqLen, HeadDim]
