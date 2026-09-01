@@ -165,6 +165,9 @@ enum Commands {
         /// `vocab.json` for `simple`).
         #[arg(long)]
         tokenizer_path: Option<String>,
+        /// Where to write `config.json` and checkpoints. Wiped and recreated on every run.
+        #[arg(long, default_value = "artifacts")]
+        artifact_dir: String,
     },
     /// Initialize the dataloader, generate a batch, detokenize it and display it.
     InspectBatch {
@@ -329,11 +332,10 @@ fn run_train(
     num_workers: usize,
     tokenizer_kind: TokenizerKind,
     tokenizer_path: Option<String>,
+    artifact_dir: &str,
 ) {
     type MyBackend = LibTorch<f32>;
     type MyAutodiffBackend = Autodiff<MyBackend>;
-
-    let artifact_dir = "artifacts";
 
     // Load the tokenizer up front purely to size the embedding and output head. The training
     // run reloads it from the config, so there is exactly one place that decides which
@@ -641,6 +643,7 @@ fn main() {
             num_workers,
             tokenizer,
             tokenizer_path,
+            artifact_dir,
         } => run_train(
             d_model,
             num_heads,
@@ -654,6 +657,7 @@ fn main() {
             num_workers,
             tokenizer,
             tokenizer_path,
+            &artifact_dir,
         ),
         Commands::InspectBatch {
             batch_size,
