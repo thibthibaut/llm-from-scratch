@@ -6,8 +6,9 @@
 //! - `train-tokenizer [--vocab-size N] [--num-docs N] [--min-frequency N] [--output PATH]`:
 //!   train a byte-level BPE tokenizer on the dataset's train split and write it to
 //!   `tokenizer.json`.
-//! - `train [--d-model N] [--num-heads N] [--num-layers N] [--context-length N] [--batch-size N]`:
-//!   train the GPT model.
+//! - `train [--d-model N] [--num-heads N] [--num-layers N] [--context-length N] [--batch-size N]
+//!   [--tokenizer simple|bpe] [--tokenizer-path PATH]`: train the GPT model. The tokenizer
+//!   choice is recorded in `artifacts/config.json`.
 //! - `inspect-batch [--batch-size N] [--context-size N]`: initialize the dataloader,
 //!   generate a single batch, detokenize it and display it.
 //! - `generate-text [--prompt "..."] [--max-new-tokens N] [--config-path PATH] [--model-path PATH]`:
@@ -26,7 +27,7 @@ use crate::model::{
     EmbeddingModuleConfig, GPTModel, GPTModelConfig, MultiHeadAttentionConfig,
     TransformerBlockConfig,
 };
-use crate::tokenizer::{BpeTokenizer, SimpleTokenizer, Token, Tokenizer};
+use crate::tokenizer::{AnyTokenizer, BpeTokenizer, SimpleTokenizer, Token, Tokenizer, TokenizerKind};
 use crate::training::TrainingConfig;
 
 use burn::Tensor;
@@ -152,6 +153,14 @@ enum Commands {
         /// Number of background dataloader worker threads.
         #[arg(long, default_value_t = NUM_WORKERS)]
         num_workers: usize,
+        /// Which tokenizer to train against. Recorded in `artifacts/config.json` so
+        /// `generate-text` reconstructs the same one.
+        #[arg(long, value_enum, default_value_t = TokenizerKind::Bpe)]
+        tokenizer: TokenizerKind,
+        /// Override where the tokenizer is loaded from (defaults to `tokenizer.json` for `bpe`,
+        /// `vocab.json` for `simple`).
+        #[arg(long)]
+        tokenizer_path: Option<String>,
     },
     /// Initialize the dataloader, generate a batch, detokenize it and display it.
     InspectBatch {
@@ -161,6 +170,12 @@ enum Commands {
         /// Maximum sequence length per item.
         #[arg(long, default_value_t = 128)]
         context_size: usize,
+        /// Which tokenizer to decode the batch with.
+        #[arg(long, value_enum, default_value_t = TokenizerKind::Bpe)]
+        tokenizer: TokenizerKind,
+        /// Override where the tokenizer is loaded from.
+        #[arg(long)]
+        tokenizer_path: Option<String>,
     },
     /// Load a trained model and run inference on `--prompt`.
     GenerateText {
@@ -285,6 +300,17 @@ fn train_tokenizer(vocab_size: usize, num_docs: usize, min_frequency: u64, outpu
     }
 }
 
+/// Resolve `--tokenizer` / `--tokenizer-path` into a loaded tokenizer and the path it came from.
+fn load_tokenizer(kind: TokenizerKind, path: Option<String>) -> (AnyTokenizer, String) {
+    let path = path.unwrap_or_else(|| kind.default_path().to_string());
+    let tokenizer = AnyTokenizer::load(kind, Path::new(&path));
+    println!(
+        "Tokenizer: {kind} from {path} ({} tokens)",
+        tokenizer.get_vocab_size()
+    );
+    (tokenizer, path)
+}
+
 /// Train the GPT model with the given architecture and training parameters.
 fn run_train(
     d_model: usize,
@@ -297,14 +323,20 @@ fn run_train(
     valid_size: usize,
     num_epochs: usize,
     num_workers: usize,
+    tokenizer_kind: TokenizerKind,
+    tokenizer_path: Option<String>,
 ) {
     type MyBackend = LibTorch<f32>;
     type MyAutodiffBackend = Autodiff<MyBackend>;
 
     let artifact_dir = "artifacts";
 
-    let tokenizer = SimpleTokenizer::from_vocab_file(Path::new(VOCAB_PATH));
+    // Load the tokenizer up front purely to size the embedding and output head. The training
+    // run reloads it from the config, so there is exactly one place that decides which
+    // tokenizer a checkpoint belongs to.
+    let (tokenizer, tokenizer_path) = load_tokenizer(tokenizer_kind, tokenizer_path);
     let vocab_size = tokenizer.get_vocab_size();
+    drop(tokenizer);
 
     let gpt_config = gpt_model_config(vocab_size, context_length, d_model, num_heads, num_layers);
     let max_train_items = if epoch_size == 0 {
@@ -323,7 +355,9 @@ fn run_train(
         TrainingConfig::new(gpt_config, AdamWConfig::new())
             .with_batch_size(batch_size)
             .with_num_epochs(num_epochs)
-            .with_num_workers(num_workers),
+            .with_num_workers(num_workers)
+            .with_tokenizer_kind(Some(tokenizer_kind))
+            .with_tokenizer_path(Some(tokenizer_path)),
         device.clone(),
         max_train_items,
         max_valid_items,
@@ -331,10 +365,15 @@ fn run_train(
 }
 
 /// Initialize the dataloader, generate a single batch, detokenize it and print it.
-fn run_inspect_batch(batch_size: usize, context_size: usize) {
+fn run_inspect_batch(
+    batch_size: usize,
+    context_size: usize,
+    tokenizer_kind: TokenizerKind,
+    tokenizer_path: Option<String>,
+) {
     type MyBackend = LibTorch<f32>;
 
-    let tokenizer = SimpleTokenizer::from_vocab_file(Path::new(VOCAB_PATH));
+    let (tokenizer, _) = load_tokenizer(tokenizer_kind, tokenizer_path);
     let batcher = TextBatcher::new(tokenizer.clone(), context_size);
 
     let dataset = load_default_fineweb_dataset();
@@ -404,8 +443,16 @@ fn run_generate_text(
     let model: GPTModel<MyBackend> = config.model.init(&device).load_record(record);
     let context_length = config.model.embedding_config.context_size;
 
-    let tokenizer = SimpleTokenizer::from_vocab_file(Path::new(VOCAB_PATH));
+    // The tokenizer comes from the saved config, never from a flag: decoding a checkpoint with
+    // a different tokenizer than it was trained on produces confident nonsense rather than an
+    // error, because the two id spaces overlap.
+    let (kind, path) = config.tokenizer_spec();
+    let (tokenizer, _) = load_tokenizer(kind, Some(path));
     let vocab_size = tokenizer.get_vocab_size();
+    assert_eq!(
+        vocab_size, config.model.embedding_config.vocab_size,
+        "tokenizer vocab size does not match the trained model's embedding vocab size"
+    );
 
     let mut tokens = tokenizer.encode(&prompt);
     if tokens.is_empty() {
@@ -566,6 +613,8 @@ fn main() {
             valid_size,
             num_epochs,
             num_workers,
+            tokenizer,
+            tokenizer_path,
         } => run_train(
             d_model,
             num_heads,
@@ -577,11 +626,15 @@ fn main() {
             valid_size,
             num_epochs,
             num_workers,
+            tokenizer,
+            tokenizer_path,
         ),
         Commands::InspectBatch {
             batch_size,
             context_size,
-        } => run_inspect_batch(batch_size, context_size),
+            tokenizer,
+            tokenizer_path,
+        } => run_inspect_batch(batch_size, context_size, tokenizer, tokenizer_path),
         Commands::GenerateText {
             prompt,
             max_new_tokens,

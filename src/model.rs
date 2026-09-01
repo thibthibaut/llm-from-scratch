@@ -79,7 +79,7 @@ pub struct EmbeddingModule<B: Backend> {
 #[derive(Config, Debug)]
 pub struct EmbeddingModuleConfig {
     pub context_size: usize,
-    vocab_size: usize,
+    pub vocab_size: usize,
     d_model: usize,
     #[config(default = 0.1)]
     dropout_prob: f64,

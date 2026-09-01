@@ -4,8 +4,9 @@ use burn::data::dataset::SqliteDataset;
 use indicatif::ProgressIterator;
 use rayon::prelude::*;
 use regex::Regex;
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs::File, io::BufWriter, path::Path, sync::LazyLock};
+use std::{collections::HashMap, fs::File, io::BufWriter, path::Path, sync::Arc, sync::LazyLock};
 use tokenizers::models::TrainerWrapper;
 use tokenizers::models::bpe::{BPE, BpeTrainerBuilder};
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
@@ -214,7 +215,10 @@ pub const END_OF_TEXT_PIECE: &str = "<|endoftext|>";
 /// `tokenizer.json` (ours, or a pretrained one downloaded from the HuggingFace Hub).
 #[derive(Debug, Clone)]
 pub struct BpeTokenizer {
-    inner: HfTokenizer,
+    // `Arc` because `TextBatcher` is cloned once per dataloader worker (`--num-workers` is 32
+    // by default) and a deep copy of a 32k vocab plus its merge table per worker is pure waste.
+    // The tokenizer is immutable after construction, so sharing it is free.
+    inner: Arc<HfTokenizer>,
     end_of_text: Token,
 }
 
@@ -226,7 +230,10 @@ impl BpeTokenizer {
             .unwrap_or_else(|| {
                 panic!("tokenizer has no `{END_OF_TEXT_PIECE}` token; the model needs one to know when to stop")
             });
-        Self { inner, end_of_text }
+        Self {
+            inner: Arc::new(inner),
+            end_of_text,
+        }
     }
 
     /// Load a tokenizer from a `tokenizer.json`.
@@ -438,5 +445,101 @@ mod tests {
         let tokenizer = tiny_tokenizer();
         let held_out = ["The lazy dog learns about energy in the world."];
         assert!(tokenizer.bytes_per_token(held_out.into_iter()) > 2.0);
+    }
+}
+
+// ----------- RUNTIME SELECTION -----------------------------------------------
+
+/// Which tokenizer implementation to use.
+///
+/// `Default` is `Simple` on purpose, and it is *not* the CLI default (which is `Bpe`). The two
+/// defaults answer different questions: serde's applies when reading a `config.json` written
+/// before this field existed, and such a run was necessarily word-level — while a new run
+/// should get the byte-level BPE tokenizer.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenizerKind {
+    /// Word-level tokenizer backed by `vocab.json`. Lossy — kept so old runs stay reproducible.
+    #[default]
+    Simple,
+    /// Byte-level BPE tokenizer backed by `tokenizer.json`. Lossless.
+    Bpe,
+}
+
+impl TokenizerKind {
+    /// The artifact this tokenizer is loaded from, when no path is given explicitly.
+    pub fn default_path(&self) -> &'static str {
+        match self {
+            Self::Simple => "vocab.json",
+            Self::Bpe => "tokenizer.json",
+        }
+    }
+}
+
+impl std::fmt::Display for TokenizerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Simple => write!(f, "simple"),
+            Self::Bpe => write!(f, "bpe"),
+        }
+    }
+}
+
+/// A tokenizer chosen at runtime.
+///
+/// An enum rather than `Box<dyn Tokenizer>`: `TextBatcher` must be `Clone` (the dataloader
+/// clones it per worker) and a boxed trait object is not, and `encode` sits in the batching hot
+/// path where a vtable indirection per item buys nothing. Adding a third tokenizer means adding
+/// a variant here and a line to each `match` — the compiler will point at every one.
+#[derive(Debug, Clone)]
+pub enum AnyTokenizer {
+    Simple(SimpleTokenizer),
+    Bpe(BpeTokenizer),
+}
+
+impl AnyTokenizer {
+    /// Load the tokenizer of the given kind from `path`.
+    pub fn load(kind: TokenizerKind, path: &Path) -> Self {
+        match kind {
+            TokenizerKind::Simple => Self::Simple(SimpleTokenizer::from_vocab_file(path)),
+            TokenizerKind::Bpe => Self::Bpe(BpeTokenizer::from_file(path)),
+        }
+    }
+}
+
+impl Tokenizer for AnyTokenizer {
+    fn encode(&self, text: &str) -> Vec<Token> {
+        match self {
+            Self::Simple(t) => t.encode(text),
+            Self::Bpe(t) => t.encode(text),
+        }
+    }
+
+    fn decode(&self, tokens: &[Token]) -> String {
+        match self {
+            Self::Simple(t) => t.decode(tokens),
+            Self::Bpe(t) => t.decode(tokens),
+        }
+    }
+
+    fn get_vocab_size(&self) -> usize {
+        match self {
+            Self::Simple(t) => t.get_vocab_size(),
+            Self::Bpe(t) => t.get_vocab_size(),
+        }
+    }
+
+    fn end_of_text(&self) -> Token {
+        match self {
+            Self::Simple(t) => t.end_of_text(),
+            Self::Bpe(t) => t.end_of_text(),
+        }
+    }
+
+    fn token_to_piece(&self, token: Token) -> Option<String> {
+        match self {
+            Self::Simple(t) => t.token_to_piece(token),
+            Self::Bpe(t) => t.token_to_piece(token),
+        }
     }
 }

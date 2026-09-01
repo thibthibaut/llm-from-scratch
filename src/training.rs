@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::dataset::{TextBatch, TextBatcher, TextItem, load_default_fineweb_dataset, split_dataset};
 use crate::model::{GPTModel, GPTModelConfig};
-use crate::tokenizer::SimpleTokenizer;
+use crate::tokenizer::{AnyTokenizer, Tokenizer, TokenizerKind};
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataset::Dataset;
 use burn::nn::loss::CrossEntropyLossConfig;
@@ -82,6 +82,35 @@ pub struct TrainingConfig {
     pub seed: u64,
     #[config(default = 1.0e-4)]
     pub learning_rate: f64,
+    /// Which tokenizer produced the token ids this model was trained on, and where it lives.
+    ///
+    /// Saved so `generate-text` can rebuild the *same* tokenizer instead of guessing. Decoding a
+    /// BPE-trained model with the word-level vocab (or vice versa) does not necessarily fail
+    /// loudly — the id spaces overlap — it just silently produces nonsense.
+    /// Which tokenizer produced the token ids this model was trained on, and where it lives.
+    ///
+    /// Saved so `generate-text` can rebuild the *same* tokenizer instead of guessing. Decoding a
+    /// BPE-trained model with the word-level vocab (or vice versa) does not fail loudly — the id
+    /// spaces overlap — it just produces confident nonsense.
+    ///
+    /// `Option` rather than a defaulted field because burn's `#[config(default)]` only feeds the
+    /// generated builder, not deserialization; a plain field would make every `config.json`
+    /// written before this existed fail to load. `None` means exactly that case, and such a run
+    /// was necessarily word-level — see `tokenizer_spec`.
+    pub tokenizer_kind: Option<TokenizerKind>,
+    pub tokenizer_path: Option<String>,
+}
+
+impl TrainingConfig {
+    /// The tokenizer this config describes, resolving the pre-`tokenizer_kind` case.
+    pub fn tokenizer_spec(&self) -> (TokenizerKind, String) {
+        let kind = self.tokenizer_kind.unwrap_or_default();
+        let path = self
+            .tokenizer_path
+            .clone()
+            .unwrap_or_else(|| kind.default_path().to_string());
+        (kind, path)
+    }
 }
 
 fn create_artifact_dir(artifact_dir: &str) {
@@ -98,14 +127,16 @@ fn create_artifact_dir(artifact_dir: &str) {
 /// Run training against the given tokenizer and train/valid datasets. Kept generic over the
 /// dataset type so tests can supply small in-memory synthetic data instead of the real
 /// (very large) fineweb dataset.
-pub fn train<B: AutodiffBackend, D: Dataset<TextItem> + 'static>(
+pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
     artifact_dir: &str,
     config: TrainingConfig,
     device: B::Device,
-    tokenizer: SimpleTokenizer,
+    tokenizer: T,
     train_dataset: D,
     valid_dataset: D,
-) {
+) where
+    T: Tokenizer + Clone + Send + Sync + 'static,
+{
     create_artifact_dir(artifact_dir);
     config
         .save(format!("{artifact_dir}/config.json"))
@@ -160,11 +191,26 @@ pub fn train_from_disk<B: AutodiffBackend>(
     max_train_items: Option<usize>,
     max_valid_items: Option<usize>,
 ) {
-    let tokenizer = SimpleTokenizer::from_vocab_file(Path::new("vocab.json"));
+    // The config is the single source of truth for which tokenizer this run uses, so that the
+    // `config.json` written next to the checkpoints always describes the tokens they were
+    // trained on.
+    let (kind, path) = config.tokenizer_spec();
+    let tokenizer = AnyTokenizer::load(kind, Path::new(&path));
+    println!(
+        "Tokenizer: {kind} from {path} ({} tokens)",
+        tokenizer.get_vocab_size()
+    );
+    assert_eq!(
+        tokenizer.get_vocab_size(),
+        config.model.embedding_config.vocab_size,
+        "tokenizer vocab size does not match the model's embedding vocab size; the model would \
+         be trained against ids it has no embedding row for"
+    );
+
     let fine_web_dataset = load_default_fineweb_dataset();
     let (train_ds, valid_ds, _test_ds) =
         split_dataset(fine_web_dataset, max_train_items, max_valid_items);
-    train::<B, _>(artifact_dir, config, device, tokenizer, train_ds, valid_ds);
+    train::<B, _, _>(artifact_dir, config, device, tokenizer, train_ds, valid_ds);
 }
 
 // ----------- TESTS -----------------------------------------------------------
@@ -174,7 +220,7 @@ mod tests {
     use crate::model::{
         EmbeddingModuleConfig, GPTModelConfig, MultiHeadAttentionConfig, TransformerBlockConfig,
     };
-    use crate::tokenizer::{Token, Tokenizer, Vocab};
+    use crate::tokenizer::{SimpleTokenizer, Token, Tokenizer, Vocab};
     use burn::backend::{Autodiff, LibTorch};
     use burn::data::dataset::InMemDataset;
     use std::collections::HashMap;
@@ -240,7 +286,7 @@ mod tests {
         let artifact_dir = std::env::temp_dir().join("llm-from-scratch-test-train-smoke");
         let artifact_dir = artifact_dir.to_str().unwrap();
 
-        train::<TestBackend, _>(
+        train::<TestBackend, _, _>(
             artifact_dir,
             config,
             device,
@@ -255,5 +301,50 @@ mod tests {
         );
 
         std::fs::remove_dir_all(artifact_dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod tokenizer_selection_tests {
+    use super::*;
+    use crate::model::{
+        EmbeddingModuleConfig, GPTModelConfig, MultiHeadAttentionConfig, TransformerBlockConfig,
+    };
+    use burn::optim::AdamWConfig;
+
+    fn dummy_config() -> TrainingConfig {
+        let gpt = GPTModelConfig::new(
+            EmbeddingModuleConfig::new(8, 32, 4),
+            TransformerBlockConfig::new(MultiHeadAttentionConfig::new(4).with_num_heads(2)),
+        );
+        TrainingConfig::new(gpt, AdamWConfig::new())
+    }
+
+    /// A `config.json` written before the tokenizer fields existed described a word-level run,
+    /// so that is what it must deserialize back to — not the new CLI default of `bpe`.
+    #[test]
+    fn legacy_config_without_tokenizer_fields_loads_as_simple() {
+        let mut value = serde_json::to_value(dummy_config()).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("tokenizer_kind");
+        obj.remove("tokenizer_path");
+
+        let loaded: TrainingConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.tokenizer_spec(), (TokenizerKind::Simple, "vocab.json".to_string()));
+    }
+
+    /// A config written today must round-trip its tokenizer choice, since `generate-text`
+    /// rebuilds the tokenizer from exactly these two fields.
+    #[test]
+    fn tokenizer_choice_round_trips_through_the_config() {
+        let config = dummy_config()
+            .with_tokenizer_kind(Some(TokenizerKind::Bpe))
+            .with_tokenizer_path(Some("tokenizer.json".to_string()));
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"bpe\""), "kind should serialize lowercase: {json}");
+
+        let loaded: TrainingConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.tokenizer_spec(), (TokenizerKind::Bpe, "tokenizer.json".to_string()));
     }
 }

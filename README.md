@@ -37,9 +37,31 @@ settings, or compare against a pretrained `tokenizer.json` from the HuggingFace 
 `--num-docs` is the memory knob, not `--vocab-size`: the trainer holds the word-frequency
 table for the whole sample in RAM before it starts merging.
 
-Note that the two tokenizers are not interchangeable for an already-trained model — switching
-changes `vocab_size`, which changes the shape of the embedding and output head, so it
-invalidates existing checkpoints under `artifacts/`.
+### Choosing one
+
+`train` and `inspect-batch` take `--tokenizer simple|bpe` (default **`bpe`**) plus an optional
+`--tokenizer-path`. Both dispatch through `AnyTokenizer`, an enum implementing the same
+`Tokenizer` trait — an enum rather than `Box<dyn Tokenizer>` because the dataloader clones the
+batcher once per worker and a boxed trait object is not `Clone`.
+
+`generate-text` takes **no** tokenizer flag. It reads the choice back out of the saved
+`config.json`, because decoding a checkpoint with the wrong tokenizer does not fail loudly —
+the two id spaces overlap, so you just get confident nonsense. `train` records
+`tokenizer_kind` and `tokenizer_path` there for exactly this reason, and both commands assert
+that the tokenizer's vocab size matches the model's embedding size.
+
+A `config.json` written before those fields existed still loads: they are `Option`, and `None`
+resolves to the word-level tokenizer, which is what such a run necessarily used.
+
+The two tokenizers are not interchangeable for an already-trained model — switching changes
+`vocab_size`, which changes the shape of the embedding and output head, so it invalidates
+existing checkpoints under `artifacts/`. (`train` clears `artifacts/` on every run anyway.)
+
+Eyeball the training data before committing GPU hours to it:
+
+```bash
+cargo run --release -- inspect-batch --batch-size 2 --context-size 64 --tokenizer bpe
+```
 
 ## GPU training setup (RunPod, or any bare CUDA box)
 
