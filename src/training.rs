@@ -1,73 +1,54 @@
-use std::path::Path;
+//! The training loop.
+//!
+//! This used to be burn-train's `SupervisedTraining`/`Learner`. That only validates and
+//! checkpoints at epoch boundaries, and an epoch over fineweb-edu 10BT is ~150k optimizer steps,
+//! so the only way to get a checkpoint was to shrink "epochs" to a few hundred steps by training
+//! on a capped slice of the corpus. The loop below walks the *whole* train split every epoch and
+//! instead validates and checkpoints every `--eval-every` steps, so a run can be watched,
+//! evaluated and resumed (`--resume`) part-way through an epoch.
+
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::dataset::{
-    TextBatch, TextBatcher, TextItem, documents_per_batch, load_default_fineweb_dataset,
+    PackedBatch, TextBatcher, TextItem, documents_per_batch, load_default_fineweb_dataset,
     split_dataset,
 };
+use crate::loader::OrderedLoader;
 use crate::model::{GPTModel, GPTModelConfig};
 use crate::tokenizer::{AnyTokenizer, Tokenizer, TokenizerKind};
-use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataset::Dataset;
+use burn::data::dataset::transform::ShuffledDataset;
+use burn::module::AutodiffModule;
 use burn::nn::loss::CrossEntropyLossConfig;
-use burn::optim::AdamWConfig;
+use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
-use burn::record::CompactRecorder;
+use burn::record::{CompactRecorder, FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
+use burn::tensor::ElementConversion;
 use burn::tensor::backend::AutodiffBackend;
-use burn::train::metric::{LossMetric, PerplexityMetric};
-use burn::train::{
-    InferenceStep, Learner, SequenceOutput, SupervisedTraining, TrainOutput, TrainStep,
-};
+use serde::{Deserialize, Serialize};
+
+/// Seed for packing the validation batches, so every evaluation scores the exact same tokens.
+const VALID_SEED: u64 = 0x5EED_0F_7A11D;
 
 impl<B: Backend> GPTModel<B> {
-    /// Compute the language modeling loss and predictions for a batch.
-    pub fn forward_loss(&self, batch: TextBatch<B>) -> SequenceOutput<B> {
-        let [batch_size, seq_len] = batch.inputs.dims();
-
-        // Forward pass: [batch_size, seq_len] -> [batch_size, seq_len, vocab_size]
-        let logits = self.forward(batch.inputs);
-        let [_batch_size, _seq_len, vocab_size] = logits.dims();
-
-        // Flatten for cross-entropy: [batch_size * seq_len, vocab_size]
-        let logits_flat = logits.clone().reshape([batch_size * seq_len, vocab_size]);
-
-        // Flatten targets: [batch_size * seq_len]
-        let targets_flat = batch.targets.clone().reshape([batch_size * seq_len]);
-
-        // Compute loss
-        let device = &logits_flat.device();
-        let loss_fn = CrossEntropyLossConfig::new().init(device);
-        let loss = loss_fn.forward(logits_flat, targets_flat);
-
-        // Compute predictions: argmax over vocab dimension
-        // argmax returns [batch_size, seq_len, 1], squeeze to [batch_size, seq_len]
-        let predictions = logits.clone().argmax(2).squeeze::<2>();
-
-        SequenceOutput {
-            loss,
-            logits,
-            predictions: Some(predictions),
-            targets: batch.targets,
-        }
-    }
-}
-
-impl<B: AutodiffBackend> TrainStep for GPTModel<B> {
-    type Input = TextBatch<B>;
-    type Output = SequenceOutput<B>;
-
-    fn step(&self, batch: TextBatch<B>) -> TrainOutput<SequenceOutput<B>> {
-        let item = self.forward_loss(batch);
-
-        TrainOutput::new(self, item.loss.backward(), item)
-    }
-}
-
-impl<B: Backend> InferenceStep for GPTModel<B> {
-    type Input = TextBatch<B>;
-    type Output = SequenceOutput<B>;
-
-    fn step(&self, batch: TextBatch<B>) -> SequenceOutput<B> {
-        self.forward_loss(batch)
+    /// Mean next-token cross-entropy over a batch.
+    ///
+    /// Only the loss: the old burn-train step also returned the full `[batch, seq, vocab]`
+    /// logits plus an argmax over them for its metrics, keeping a multi-GB tensor alive per
+    /// step for nothing the loop reads.
+    pub fn loss(&self, inputs: Tensor<B, 2, Int>, targets: Tensor<B, 2, Int>) -> Tensor<B, 1> {
+        let [batch_size, seq_len] = inputs.dims();
+        let logits = self.forward(inputs);
+        let [_, _, vocab_size] = logits.dims();
+        let logits = logits.reshape([batch_size * seq_len, vocab_size]);
+        let targets = targets.reshape([batch_size * seq_len]);
+        CrossEntropyLossConfig::new()
+            .init(&logits.device())
+            .forward(logits, targets)
     }
 }
 
@@ -85,11 +66,6 @@ pub struct TrainingConfig {
     pub seed: u64,
     #[config(default = 1.0e-4)]
     pub learning_rate: f64,
-    /// Which tokenizer produced the token ids this model was trained on, and where it lives.
-    ///
-    /// Saved so `generate-text` can rebuild the *same* tokenizer instead of guessing. Decoding a
-    /// BPE-trained model with the word-level vocab (or vice versa) does not necessarily fail
-    /// loudly — the id spaces overlap — it just silently produces nonsense.
     /// Which tokenizer produced the token ids this model was trained on, and where it lives.
     ///
     /// Saved so `generate-text` can rebuild the *same* tokenizer instead of guessing. Decoding a
@@ -116,23 +92,177 @@ impl TrainingConfig {
     }
 }
 
-fn create_artifact_dir(artifact_dir: &str) {
-    // Remove existing artifacts before to get an accurate learner summary
-    if let Err(err) = std::fs::remove_dir_all(artifact_dir)
+/// How the loop is driven. Unlike `TrainingConfig` this is not part of what a checkpoint *is*,
+/// so it is not saved in `config.json` and can change between a run and its resumption.
+#[derive(Clone, Debug)]
+pub struct RunOptions {
+    /// Validate and checkpoint every this many optimizer steps (and at the end).
+    pub eval_every: usize,
+    /// Number of batches from the start of the validation split scored at each evaluation.
+    pub valid_batches: usize,
+    /// Print and record the training loss every this many steps.
+    pub log_every: usize,
+    /// Stop (after a final checkpoint) once this many steps have run in total.
+    pub max_steps: Option<usize>,
+    /// Continue from `<artifact_dir>/checkpoint` instead of starting fresh.
+    pub resume: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            eval_every: 1000,
+            valid_batches: 30,
+            log_every: 50,
+            max_steps: None,
+            resume: false,
+        }
+    }
+}
+
+/// Where the loop is. Saved in every checkpoint so `--resume` can carry on mid-epoch.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+struct TrainState {
+    /// Current epoch, 0-based.
+    epoch: usize,
+    /// Batches of the current epoch already trained on; the next one to train is this index.
+    batch_in_epoch: usize,
+    /// Optimizer steps since the start of the run.
+    global_step: usize,
+    best_valid_loss: Option<f64>,
+}
+
+type CheckpointRecorder = NamedMpkFileRecorder<FullPrecisionSettings>;
+
+fn checkpoint_dir(artifact_dir: &str) -> PathBuf {
+    Path::new(artifact_dir).join("checkpoint")
+}
+
+/// Write model + optimizer + loop state for `--resume`, atomically: everything goes into a
+/// scratch directory that is renamed over the previous checkpoint once complete, so a crash
+/// mid-write never leaves a half-written checkpoint behind.
+fn save_checkpoint<B: AutodiffBackend, O: Optimizer<GPTModel<B>, B>>(
+    artifact_dir: &str,
+    model: &GPTModel<B>,
+    optim: &O,
+    state: &TrainState,
+) {
+    let dir = checkpoint_dir(artifact_dir);
+    let tmp = Path::new(artifact_dir).join("checkpoint.tmp");
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).expect("create checkpoint dir");
+    let recorder = CheckpointRecorder::new();
+    model
+        .clone()
+        .save_file(tmp.join("model"), &recorder)
+        .expect("save model checkpoint");
+    recorder
+        .record(optim.to_record(), tmp.join("optim"))
+        .expect("save optimizer checkpoint");
+    fs::write(
+        tmp.join("state.json"),
+        serde_json::to_string_pretty(state).unwrap(),
+    )
+    .expect("save loop state");
+    let _ = fs::remove_dir_all(&dir);
+    fs::rename(&tmp, &dir).expect("move checkpoint into place");
+}
+
+fn load_checkpoint<B: AutodiffBackend, O: Optimizer<GPTModel<B>, B>>(
+    artifact_dir: &str,
+    model: GPTModel<B>,
+    optim: O,
+    device: &B::Device,
+) -> (GPTModel<B>, O, TrainState) {
+    let dir = checkpoint_dir(artifact_dir);
+    let recorder = CheckpointRecorder::new();
+    let model = model
+        .load_file(dir.join("model"), &recorder, device)
+        .expect("load model checkpoint");
+    let optim = optim.load_record(
+        recorder
+            .load(dir.join("optim"), device)
+            .expect("load optimizer checkpoint"),
+    );
+    let state = serde_json::from_str(
+        &fs::read_to_string(dir.join("state.json")).expect("read checkpoint state.json"),
+    )
+    .expect("parse checkpoint state.json");
+    (model, optim, state)
+}
+
+/// Appends one row per log/eval event to `<artifact_dir>/metrics.csv`.
+struct MetricsLog {
+    path: PathBuf,
+}
+
+impl MetricsLog {
+    fn new(artifact_dir: &str) -> Self {
+        let path = Path::new(artifact_dir).join("metrics.csv");
+        if !path.exists() {
+            fs::write(&path, "step,epoch,tokens,split,loss,tokens_per_sec\n")
+                .expect("create metrics.csv");
+        }
+        Self { path }
+    }
+
+    fn append(&self, step: usize, epoch: f64, tokens: usize, split: &str, loss: f64, tps: f64) {
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .expect("open metrics.csv");
+        writeln!(f, "{step},{epoch:.5},{tokens},{split},{loss:.5},{tps:.0}").unwrap();
+    }
+}
+
+fn reset_artifact_dir(artifact_dir: &str) {
+    if let Err(err) = fs::remove_dir_all(artifact_dir)
         && err.kind() != std::io::ErrorKind::NotFound
     {
         panic!("Failed to clear artifact dir '{artifact_dir}': {err}");
     }
-    std::fs::create_dir_all(artifact_dir)
+    fs::create_dir_all(artifact_dir)
         .unwrap_or_else(|err| panic!("Failed to create artifact dir '{artifact_dir}': {err}"));
+}
+
+/// Mean loss over the (pre-packed) validation batches.
+fn validate<B: Backend, T: Tokenizer>(
+    model: &GPTModel<B>,
+    batcher: &TextBatcher<T>,
+    batches: &[PackedBatch],
+    device: &B::Device,
+) -> f64 {
+    let mut total: Option<Tensor<B, 1>> = None;
+    for packed in batches {
+        let batch = batcher.upload::<B>(packed.clone(), device);
+        let loss = model.loss(batch.inputs, batch.targets);
+        total = Some(match total {
+            Some(t) => t + loss,
+            None => loss,
+        });
+    }
+    total.map_or(f64::NAN, |t| {
+        t.into_scalar().elem::<f64>() / batches.len() as f64
+    })
+}
+
+fn format_duration(secs: f64) -> String {
+    let secs = secs.max(0.0) as u64;
+    format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
 }
 
 /// Run training against the given tokenizer and train/valid datasets. Kept generic over the
 /// dataset type so tests can supply small in-memory synthetic data instead of the real
 /// (very large) fineweb dataset.
+///
+/// Every epoch walks the whole train split in a fresh shuffled order. Every `eval_every` steps
+/// the first `valid_batches` batches of the validation split are scored, `model` (latest) and
+/// `best-model` (lowest validation loss) are written for `generate-text`, and a full-precision
+/// checkpoint is written to `checkpoint/` for `--resume`.
 pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
     artifact_dir: &str,
     config: TrainingConfig,
+    options: RunOptions,
     device: B::Device,
     tokenizer: T,
     train_dataset: D,
@@ -140,69 +270,219 @@ pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
 ) where
     T: Tokenizer + Clone + Send + Sync + 'static,
 {
-    create_artifact_dir(artifact_dir);
-    config
-        .save(format!("{artifact_dir}/config.json"))
-        .expect("Config should be saved successfully");
+    if options.resume {
+        assert!(
+            checkpoint_dir(artifact_dir).join("state.json").exists(),
+            "--resume: no checkpoint in '{artifact_dir}/checkpoint'"
+        );
+    } else {
+        reset_artifact_dir(artifact_dir);
+        config
+            .save(format!("{artifact_dir}/config.json"))
+            .expect("Config should be saved successfully");
+    }
 
     B::seed(&device, config.seed);
 
     let context_size = config.model.embedding_config.context_size;
     let batcher = TextBatcher::new(tokenizer, context_size, config.batch_size);
+    let tokens_per_step = config.batch_size * context_size;
 
-    // The dataloader's batch size is a number of *documents*, not of training sequences. The
-    // batcher packs that pool of documents into one flat token stream and cuts
-    // `config.batch_size` sequences out of it, so what it needs from the dataloader is a token
-    // budget. See `documents_per_batch`.
+    // The loader hands the batcher a pool of *documents* per step, sized to cover the token
+    // budget of `batch_size` sequences; see `documents_per_batch`.
     let docs_per_batch = documents_per_batch(config.batch_size, context_size);
+    let train_dataset = Arc::new(train_dataset);
+    let valid_dataset: Arc<dyn Dataset<TextItem>> = Arc::new(valid_dataset);
+    let steps_per_epoch = OrderedLoader::num_batches(train_dataset.len(), docs_per_batch);
+    assert!(
+        steps_per_epoch > 0,
+        "train split ({} documents) is smaller than one batch ({docs_per_batch} documents)",
+        train_dataset.len()
+    );
+    let valid_batches = options
+        .valid_batches
+        .min(OrderedLoader::num_batches(valid_dataset.len(), docs_per_batch))
+        .max(1);
+    let total_steps = (steps_per_epoch * config.num_epochs)
+        .min(options.max_steps.unwrap_or(usize::MAX));
+    let num_workers = config.num_workers.max(1);
+    let prefetch = 4 * num_workers;
+
     println!(
-        "Batching: {} sequences x {} tokens per step, packed from a document pool of {}",
-        config.batch_size, context_size, docs_per_batch
+        "Training: {} sequences x {context_size} tokens per step ({tokens_per_step} tokens, \
+         {docs_per_batch} documents), {steps_per_epoch} steps per epoch, {} epochs, \
+         {total_steps} steps total. Validating on {valid_batches} batches every {} steps.",
+        config.batch_size, config.num_epochs, options.eval_every
     );
 
-    let dataloader_train = DataLoaderBuilder::new(batcher.clone())
-        .batch_size(docs_per_batch)
-        .shuffle(config.seed)
-        .num_workers(config.num_workers)
-        .set_device(device.clone())
-        .build(train_dataset);
-
-    let dataloader_test = DataLoaderBuilder::new(batcher)
-        .batch_size(docs_per_batch)
-        .shuffle(config.seed)
-        .num_workers(config.num_workers)
-        .set_device(device.clone())
-        .build(valid_dataset);
-
-    let training = SupervisedTraining::new(artifact_dir, dataloader_train, dataloader_test)
-        .metrics((LossMetric::new(), PerplexityMetric::new()))
-        .with_file_checkpointer(CompactRecorder::new())
-        .num_epochs(config.num_epochs)
-        .summary();
+    // Validation batches never change, so pack them once.
+    let valid_packed: Vec<PackedBatch> = OrderedLoader::new(
+        valid_dataset,
+        batcher.clone(),
+        docs_per_batch,
+        0,
+        valid_batches,
+        VALID_SEED,
+        num_workers,
+        prefetch,
+    )
+    .map(|(_, batch)| batch)
+    .collect();
 
     let model = config.model.init::<B>(&device);
-    let result = training.launch(Learner::new(
-        model,
-        config.optimizer.init(),
-        config.learning_rate,
-    ));
+    let optim = config.optimizer.init::<B, GPTModel<B>>();
+    let (mut model, mut optim, mut state) = if options.resume {
+        let (model, optim, state) = load_checkpoint(artifact_dir, model, optim, &device);
+        println!(
+            "Resuming at step {} (epoch {}, batch {}/{steps_per_epoch})",
+            state.global_step, state.epoch, state.batch_in_epoch
+        );
+        (model, optim, state)
+    } else {
+        (model, optim, TrainState::default())
+    };
 
-    result
-        .model
-        .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
-        .expect("Trained model should be saved successfully");
+    let metrics = MetricsLog::new(artifact_dir);
+    let run_start = Instant::now();
+    let run_start_step = state.global_step;
+
+    // Runs validation and writes everything a later `generate-text` or `--resume` needs.
+    let evaluate = |model: &GPTModel<B>, optim: &_, state: &mut TrainState| {
+        let valid_loss = validate(&model.valid(), &batcher, &valid_packed, &device);
+        let epoch_frac = state.epoch as f64 + state.batch_in_epoch as f64 / steps_per_epoch as f64;
+        let improved = state.best_valid_loss.is_none_or(|best| valid_loss < best);
+        println!(
+            "[eval] step {} | epoch {epoch_frac:.3} | valid loss {valid_loss:.4} | ppl {:.2}{}",
+            state.global_step,
+            valid_loss.exp(),
+            if improved { " (best)" } else { "" }
+        );
+        metrics.append(
+            state.global_step,
+            epoch_frac,
+            state.global_step * tokens_per_step,
+            "valid",
+            valid_loss,
+            0.0,
+        );
+        if improved {
+            state.best_valid_loss = Some(valid_loss);
+            model
+                .clone()
+                .save_file(format!("{artifact_dir}/best-model"), &CompactRecorder::new())
+                .expect("save best model");
+        }
+        model
+            .clone()
+            .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
+            .expect("save model");
+        save_checkpoint(artifact_dir, model, optim, state);
+    };
+
+    let mut interval_loss: Option<Tensor<B::InnerBackend, 1>> = None;
+    let mut interval_steps = 0usize;
+    let mut interval_start = Instant::now();
+
+    'epochs: while state.epoch < config.num_epochs && state.global_step < total_steps {
+        // A different, reproducible order every epoch.
+        let shuffled: Arc<dyn Dataset<TextItem>> = Arc::new(ShuffledDataset::new(
+            train_dataset.clone(),
+            config.seed.wrapping_add(state.epoch as u64),
+        ));
+        let batch_seed = config.seed ^ ((state.epoch as u64) << 32);
+        let loader = OrderedLoader::new(
+            shuffled,
+            batcher.clone(),
+            docs_per_batch,
+            state.batch_in_epoch,
+            steps_per_epoch,
+            batch_seed,
+            num_workers,
+            prefetch,
+        );
+
+        for (index, packed) in loader {
+            let batch = batcher.upload::<B>(packed, &device);
+            let loss = model.loss(batch.inputs, batch.targets);
+
+            // Accumulate on the device: reading the loss back every step would make the CPU wait
+            // for the GPU to drain each step before it could queue the next one.
+            let detached = loss.clone().detach().inner();
+            interval_loss = Some(match interval_loss {
+                Some(sum) => sum + detached,
+                None => detached,
+            });
+            interval_steps += 1;
+
+            let grads = GradientsParams::from_grads(loss.backward(), &model);
+            model = optim.step(config.learning_rate, model, grads);
+
+            state.global_step += 1;
+            state.batch_in_epoch = index + 1;
+            if state.batch_in_epoch == steps_per_epoch {
+                // Roll over now rather than after the loop, so a checkpoint taken on the last
+                // step of an epoch already points at the start of the next one.
+                state.epoch += 1;
+                state.batch_in_epoch = 0;
+            }
+
+            if state.global_step.is_multiple_of(options.log_every) {
+                let mean = interval_loss.take().unwrap().into_scalar().elem::<f64>()
+                    / interval_steps as f64;
+                let elapsed = interval_start.elapsed().as_secs_f64();
+                let tps = (interval_steps * tokens_per_step) as f64 / elapsed;
+                let run_rate = (state.global_step - run_start_step) as f64
+                    / run_start.elapsed().as_secs_f64();
+                let eta = (total_steps - state.global_step) as f64 / run_rate;
+                let epoch_frac =
+                    state.epoch as f64 + state.batch_in_epoch as f64 / steps_per_epoch as f64;
+                println!(
+                    "step {}/{total_steps} | epoch {epoch_frac:.3} | loss {mean:.4} | \
+                     {tps:.0} tok/s | {:.0} ms/step | eta {}",
+                    state.global_step,
+                    1000.0 * elapsed / interval_steps as f64,
+                    format_duration(eta)
+                );
+                metrics.append(
+                    state.global_step,
+                    epoch_frac,
+                    state.global_step * tokens_per_step,
+                    "train",
+                    mean,
+                    tps,
+                );
+                interval_steps = 0;
+                interval_start = Instant::now();
+            }
+
+            if state.global_step.is_multiple_of(options.eval_every) {
+                evaluate(&model, &optim, &mut state);
+                // Don't charge the evaluation to the next interval's throughput.
+                interval_start = Instant::now();
+            }
+
+            if state.global_step >= total_steps {
+                break 'epochs;
+            }
+        }
+    }
+
+    if !state.global_step.is_multiple_of(options.eval_every) {
+        evaluate(&model, &optim, &mut state);
+    }
+    println!(
+        "Done: {} steps in {}",
+        state.global_step - run_start_step,
+        format_duration(run_start.elapsed().as_secs_f64())
+    );
 }
 
 /// Load the tokenizer and the full fineweb dataset from disk, then run `train`.
-///
-/// `max_train_items`/`max_valid_items` cap the train/validation split sizes — see
-/// `split_dataset` for why that matters for checkpoint cadence.
 pub fn train_from_disk<B: AutodiffBackend>(
     artifact_dir: &str,
     config: TrainingConfig,
+    options: RunOptions,
     device: B::Device,
-    max_train_items: Option<usize>,
-    max_valid_items: Option<usize>,
 ) {
     // The config is the single source of truth for which tokenizer this run uses, so that the
     // `config.json` written next to the checkpoints always describes the tokens they were
@@ -221,9 +501,13 @@ pub fn train_from_disk<B: AutodiffBackend>(
     );
 
     let fine_web_dataset = load_default_fineweb_dataset();
-    let (train_ds, valid_ds, _test_ds) =
-        split_dataset(fine_web_dataset, max_train_items, max_valid_items);
-    train::<B, _, _>(artifact_dir, config, device, tokenizer, train_ds, valid_ds);
+    let (train_ds, valid_ds, _test_ds) = split_dataset(fine_web_dataset);
+    println!(
+        "Dataset: {} train / {} validation documents",
+        train_ds.len(),
+        valid_ds.len()
+    );
+    train::<B, _, _>(artifact_dir, config, options, device, tokenizer, train_ds, valid_ds);
 }
 
 // ----------- TESTS -----------------------------------------------------------
@@ -276,42 +560,74 @@ mod tests {
         )
     }
 
-    /// Exercises a full train step and a full validation step against tiny synthetic data and
-    /// a tiny model, so it runs in well under a second instead of the many hours a real epoch
-    /// over the fineweb dataset would take.
-    #[test]
-    fn test_train_runs_one_epoch_on_synthetic_data() {
-        let device = Default::default();
-        let tokenizer = synthetic_tokenizer();
-        let vocab_size = tokenizer.get_vocab_size();
-
+    fn tiny_config() -> TrainingConfig {
+        let vocab_size = synthetic_tokenizer().get_vocab_size();
         let embedding_config = EmbeddingModuleConfig::new(4, vocab_size, 8);
         let mha_config = MultiHeadAttentionConfig::new(8).with_num_heads(2);
         let transformer_config = TransformerBlockConfig::new(mha_config);
         let model_config =
             GPTModelConfig::new(embedding_config, transformer_config).with_num_transformer_layers(1);
 
-        let config = TrainingConfig::new(model_config, AdamWConfig::new())
+        TrainingConfig::new(model_config, AdamWConfig::new())
             .with_num_epochs(1)
             .with_batch_size(2)
-            .with_num_workers(0);
+            .with_num_workers(1)
+    }
 
-        let artifact_dir = std::env::temp_dir().join("llm-from-scratch-test-train-smoke");
-        let artifact_dir = artifact_dir.to_str().unwrap();
-
+    fn run(artifact_dir: &str, config: TrainingConfig, options: RunOptions) {
         train::<TestBackend, _, _>(
             artifact_dir,
             config,
-            device,
-            tokenizer,
+            options,
+            Default::default(),
+            synthetic_tokenizer(),
             synthetic_dataset(),
             synthetic_dataset(),
         );
+    }
 
-        assert!(
-            Path::new(&format!("{artifact_dir}/model.mpk")).exists(),
-            "trained model should have been saved after the train + valid step"
-        );
+    fn state(artifact_dir: &str) -> TrainState {
+        let json = std::fs::read_to_string(format!("{artifact_dir}/checkpoint/state.json")).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// One full epoch over tiny synthetic data with a tiny model, so it runs in well under a
+    /// second instead of the many hours a real epoch over the fineweb dataset would take.
+    #[test]
+    fn test_train_runs_one_full_epoch_on_synthetic_data() {
+        let artifact_dir = std::env::temp_dir().join("llm-from-scratch-test-train-smoke");
+        let artifact_dir = artifact_dir.to_str().unwrap();
+
+        run(artifact_dir, tiny_config(), RunOptions { eval_every: 3, ..RunOptions::default() });
+
+        for file in ["model.mpk", "best-model.mpk", "config.json", "metrics.csv"] {
+            assert!(
+                Path::new(&format!("{artifact_dir}/{file}")).exists(),
+                "{file} should have been written"
+            );
+        }
+        // 4 documents, one document per batch at this size: a full epoch is 4 steps.
+        let state = state(artifact_dir);
+        assert_eq!(state.global_step, 4);
+        assert_eq!(state.epoch, 1);
+
+        std::fs::remove_dir_all(artifact_dir).ok();
+    }
+
+    /// Stopping at `--max-steps` and resuming must pick up at the next batch of the same epoch.
+    #[test]
+    fn test_resume_continues_mid_epoch() {
+        let artifact_dir = std::env::temp_dir().join("llm-from-scratch-test-train-resume");
+        let artifact_dir = artifact_dir.to_str().unwrap();
+        let options = RunOptions { eval_every: 100, ..RunOptions::default() };
+
+        run(artifact_dir, tiny_config().with_num_epochs(2), RunOptions { max_steps: Some(3), ..options.clone() });
+        let first = state(artifact_dir);
+        assert_eq!((first.epoch, first.batch_in_epoch, first.global_step), (0, 3, 3));
+
+        run(artifact_dir, tiny_config().with_num_epochs(2), RunOptions { resume: true, ..options });
+        let second = state(artifact_dir);
+        assert_eq!((second.epoch, second.global_step), (2, 8));
 
         std::fs::remove_dir_all(artifact_dir).ok();
     }

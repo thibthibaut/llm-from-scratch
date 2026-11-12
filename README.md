@@ -63,6 +63,27 @@ Eyeball the training data before committing GPU hours to it:
 cargo run --release -- inspect-batch --batch-size 2 --context-size 64 --tokenizer bpe
 ```
 
+## Training
+
+```bash
+cargo run --release -- train --device cuda --batch-size 4   # largest batch that fits 24 GB
+```
+
+Each epoch is a full pass over the train split (80% of the corpus) in a fresh shuffled order;
+`--num-epochs` defaults to 1. Since an epoch is long (~150k steps at 64 × 1024 tokens per step),
+the loop evaluates on a step cadence instead: every `--eval-every` steps it scores the first
+`--valid-batches` batches of the validation split (always the same tokens, so evaluations are
+comparable) and writes, under `--artifact-dir` (default `artifacts/`):
+
+- `model.mpk` — the latest weights, what `generate-text` loads by default;
+- `best-model.mpk` — the weights with the lowest validation loss so far;
+- `checkpoint/` — full-precision model, optimizer state and loop position, for `--resume`;
+- `metrics.csv` — train loss every `--log-every` steps, validation loss at each evaluation.
+
+`--resume` continues from `checkpoint/` at the exact batch it stopped on, using the settings in
+the saved `config.json`. `--max-steps` stops early (after a checkpoint), which is handy for
+benchmarks.
+
 ## GPU training setup (RunPod, or any bare CUDA box)
 
 Notes from getting this running on a rented RunPod pod, kept here so a Dockerfile can be
