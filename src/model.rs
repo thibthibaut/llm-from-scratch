@@ -1,14 +1,84 @@
 use burn::Tensor;
 use burn::config::Config;
 use burn::nn::activation::{Activation, ActivationConfig};
-use burn::nn::attention::generate_autoregressive_mask;
 use burn::nn::{DropoutConfig, LayerNorm, LayerNormConfig, LinearConfig};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Int, activation};
+use burn::tensor::{FloatDType, Int};
 use burn::{
     module::Module,
     nn::{Dropout, Embedding, EmbeddingConfig, Linear},
 };
+use serde::{Deserialize, Serialize};
+
+use crate::ops::{FusedOps, causal_attention};
+
+// --- Numeric precision --------------------------------------------------------
+
+/// What the matrix multiplications run in. Weights, optimizer state, layer norms, residual
+/// stream and loss always stay f32; only the matmul inputs (and attention) change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Precision {
+    /// Plain f32 everywhere: bit-for-bit what the model computed before this option existed.
+    #[default]
+    F32,
+    /// f32 tensors, but cuBLAS may run f32 matmuls on TF32 tensor cores (10-bit mantissa
+    /// inputs, f32 accumulation). Set process-wide, see `Precision::configure_process`.
+    Tf32,
+    /// Mixed precision in the style of PyTorch autocast: matmul and attention inputs are cast to
+    /// bf16 (f32 accumulation), everything else stays f32, and the f32 master weights are what
+    /// the optimizer updates. *Not* the same as running the model in bf16, which loses small
+    /// weight updates to bf16's 8-bit mantissa.
+    Bf16,
+}
+
+impl Precision {
+    /// The dtype matmuls run in, when it isn't f32.
+    fn compute_dtype(self) -> Option<FloatDType> {
+        match self {
+            Precision::Bf16 => Some(FloatDType::BF16),
+            Precision::F32 | Precision::Tf32 => None,
+        }
+    }
+
+    /// Apply the process-wide part of this precision. Must run before libtorch creates its
+    /// cuBLAS handle, i.e. before the first CUDA op.
+    pub fn configure_process(self) {
+        if self != Precision::F32 {
+            // libtorch reads this when it decides whether f32 matmuls may use TF32; it's the C++
+            // equivalent of Python's `torch.backends.cuda.matmul.allow_tf32 = True`. In bf16 mode
+            // it only affects the few matmuls that stay f32.
+            // SAFETY: called at startup, before any other thread exists.
+            unsafe { std::env::set_var("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1") };
+        }
+    }
+}
+
+/// `linear.forward(x)`, with the inputs cast to the compute dtype. The output stays in the
+/// compute dtype, so consecutive low-precision ops don't bounce through f32.
+fn linear_lowp<B: Backend, const D: usize>(
+    linear: &Linear<B>,
+    x: Tensor<B, D>,
+    precision: Precision,
+) -> Tensor<B, D> {
+    match precision.compute_dtype() {
+        None => linear.forward(x),
+        Some(dtype) => burn::tensor::module::linear(
+            x.cast(dtype),
+            linear.weight.val().cast(dtype),
+            linear.bias.as_ref().map(|b| b.val().cast(dtype)),
+        ),
+    }
+}
+
+/// Back to f32 for the residual stream and layer norms.
+fn to_f32<B: Backend, const D: usize>(x: Tensor<B, D>, precision: Precision) -> Tensor<B, D> {
+    match precision.compute_dtype() {
+        None => x,
+        Some(_) => x.cast(FloatDType::F32),
+    }
+}
+
+use burn::tensor::backend::Backend;
 
 // --- GPT model ---
 #[derive(Module, Debug)]
@@ -49,21 +119,28 @@ impl GPTModelConfig {
     }
 }
 
-impl<B: Backend> GPTModel<B> {
+impl<B: FusedOps> GPTModel<B> {
+    /// Logits in f32.
     pub fn forward(&self, indices: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        self.forward_with(indices, Precision::F32)
+    }
+
+    /// Logits, in the compute dtype of `precision` (bf16 logits are half the memory of the
+    /// largest activation in the model; the loss upcasts them chunk by chunk).
+    pub fn forward_with(&self, indices: Tensor<B, 2, Int>, precision: Precision) -> Tensor<B, 3> {
         // 1. Pass through embeddings
         let mut x = self.embedding_layer.forward(indices);
 
         // 2. Pass through all transformer blocks
         for layer in self.transformer_layers.iter() {
-            x = layer.forward(x);
+            x = layer.forward_with(x, precision);
         }
 
         // 3. Final layer norm
         x = self.layer_norm.forward(x);
 
         // 4. Output projection to vocabulary size
-        self.out_head.forward(x)
+        linear_lowp(&self.out_head, x, precision)
     }
 }
 
@@ -182,56 +259,40 @@ impl MultiHeadAttentionConfig {
     }
 }
 
-impl<B: Backend> MultiHeadAttention<B> {
+impl<B: FusedOps> MultiHeadAttention<B> {
+    #[cfg(test)]
     pub fn forward(&self, sequence: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.forward_with(sequence, Precision::F32)
+    }
+
+    pub fn forward_with(&self, sequence: Tensor<B, 3>, precision: Precision) -> Tensor<B, 3> {
         // Input shape is [Batch Size, Sequence Lenght, Input Dimension]
         let [batch_size, seq_len, _d_model] = sequence.dims();
 
         // Compute Q, K, V
         // Note: it's fine to clone tensors in burn, it's just a shallow clone
-        let keys = self.key_weights.forward(sequence.clone());
-        let values = self.value_weights.forward(sequence.clone());
-        let queries = self.query_weights.forward(sequence.clone());
+        let keys = linear_lowp(&self.key_weights, sequence.clone(), precision);
+        let values = linear_lowp(&self.value_weights, sequence.clone(), precision);
+        let queries = linear_lowp(&self.query_weights, sequence, precision);
         // Shape is now [batch_size, seq_len, d_model]
 
         // We need to reshape to perform multi-head attention:
         // Basically we split the model dimension between all the heads
         // [B, seq_len, d_model] -> [B, seq, num_heads, head_dim]
         // And we rearange so that the last 2 dimensions are seq_len, head_dim
-        // so that we can do matrix multiplication later
         // [B, seq, num_heads, head_dim] [B, num_heads, seq_len, head_dim]
-        let keys = keys
-            .reshape([batch_size, seq_len, self.num_heads, self.head_dim])
-            .swap_dims(1, 2);
-        let values = values
-            .reshape([batch_size, seq_len, self.num_heads, self.head_dim])
-            .swap_dims(1, 2);
-        let queries = queries
-            .reshape([batch_size, seq_len, self.num_heads, self.head_dim])
-            .swap_dims(1, 2);
+        let split_heads = |t: Tensor<B, 3>| {
+            t.reshape([batch_size, seq_len, self.num_heads, self.head_dim])
+                .swap_dims(1, 2)
+        };
+        let (queries, keys, values) = (split_heads(queries), split_heads(keys), split_heads(values));
 
-        // Compute the attention scores with Q @ K^T
-        // Q @ K^T  : [B, NumHeads, SeqLen, HeadDim] @ [B, NumHeads, HeadDim, SeqLen]
-        //          = [B, NumHeads, SeqLen, SeqLen]
-        let scale = (self.head_dim as f64).sqrt();
-        let attn_scores = queries.matmul(keys.swap_dims(2, 3)) / scale;
-
-        // Apply causal mask: true values are masked out.
-        let mask =
-            generate_autoregressive_mask::<B>(batch_size, seq_len, &sequence.clone().device())
-                .unsqueeze_dim::<4>(1);
-
-        let masking_value: f32 = -1.0e4_f32; // f32::NEG_INFINITY
-        let attn_scores = attn_scores.mask_fill(mask, masking_value);
-
-        // Softmax over last dim (the key dimension)
-        let attn_weights = activation::softmax(attn_scores, 3); // dim=3 = SeqLen of keys
-        // Apply dropout
-        // let attn_weights = self.dropout.forward(attn_weights);
-
-        // attn_weights @ V : [B, NumHeads, SeqLen, SeqLen] @ [B, NumHeads, SeqLen, HeadDim]
-        //                  = [B, NumHeads, SeqLen, HeadDim]
-        let context = attn_weights.matmul(values);
+        // softmax(Q Kᵀ / √head_dim + causal mask) V, as one fused kernel (FlashAttention for
+        // bf16, memory-efficient attention for f32). Writing it out op by op made autodiff keep
+        // several [B, NumHeads, SeqLen, SeqLen] tensors per layer alive for the backward pass,
+        // which is what capped the batch size; see `crate::ops`.
+        // Attention dropout isn't applied (it was already disabled).
+        let context = causal_attention(queries, keys, values);
 
         // [B, NumHeads, SeqLen, HeadDim] -> [B, SeqLen, NumHeads, HeadDim] -> [B, SeqLen, D_out]
         let context =
@@ -240,7 +301,7 @@ impl<B: Backend> MultiHeadAttention<B> {
                 .reshape([batch_size, seq_len, self.num_heads * self.head_dim]);
 
         // Final projection [B, SeqLen, D_out] -> [B, SeqLen, D_out]
-        self.out_projection.forward(context)
+        to_f32(linear_lowp(&self.out_projection, context, precision), precision)
     }
 }
 
@@ -289,14 +350,14 @@ impl TransformerBlockConfig {
     }
 }
 
-impl<B: Backend> TransformerBlock<B> {
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+impl<B: FusedOps> TransformerBlock<B> {
+    pub fn forward_with(&self, x: Tensor<B, 3>, precision: Precision) -> Tensor<B, 3> {
         let shortcut = x.clone();
 
         // Layer normalization
         let x = self.layer_norm1.forward(x);
         // Self attention
-        let x = self.mha.forward(x);
+        let x = self.mha.forward_with(x, precision);
 
         // let x = self.dropout1.forward(x);
 
@@ -308,10 +369,10 @@ impl<B: Backend> TransformerBlock<B> {
         // Layer norm
         let x = self.layer_norm2.forward(x);
 
-        // MLP
-        let x = self.linear1.forward(x);
+        // MLP (the activation runs in the compute dtype, like autocast does)
+        let x = linear_lowp(&self.linear1, x, precision);
         let x = self.activation.forward(x);
-        let x = self.linear2.forward(x);
+        let x = to_f32(linear_lowp(&self.linear2, x, precision), precision);
 
         // let x = self.dropout2.forward(x);
 

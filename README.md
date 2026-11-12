@@ -66,7 +66,7 @@ cargo run --release -- inspect-batch --batch-size 2 --context-size 64 --tokenize
 ## Training
 
 ```bash
-cargo run --release -- train --device cuda --batch-size 4   # largest batch that fits 24 GB
+cargo run --release -- train --device cuda --precision bf16 --micro-batch-size 16
 ```
 
 Each epoch is a full pass over the train split (80% of the corpus) in a fresh shuffled order;
@@ -89,6 +89,37 @@ early (after a checkpoint), which is handy for benchmarks.
 
 Checkpoints are written to `checkpoint.tmp/`, flushed, and only then swapped into place, so a
 crash at any point leaves a complete checkpoint that `--resume` finds.
+
+### Precision and memory
+
+`--precision` picks what the matrix multiplications run in; weights, AdamW state, layer norms,
+the residual stream and the loss stay f32 in every mode:
+
+- `f32` (default) — exact; the reference.
+- `tf32` — f32 tensors, TF32 tensor-core matmuls (what PyTorch's `allow_tf32` enables).
+- `bf16` — autocast-style mixed precision: matmul and attention inputs cast to bf16 with f32
+  accumulation, f32 master weights. This is the standard way GPT-2/3, Llama and nanoGPT are
+  trained. It is *not* the same as running the whole model in bf16 (`LibTorch<bf16>`), which
+  does hurt training: bf16's 8-bit mantissa rounds small weight updates away.
+
+`--micro-batch-size` splits each `--batch-size` batch into micro-batches whose gradients are
+summed before the optimizer step: same training math, less memory.
+
+Measured on an idle RTX 4090 (24 GB), GPT-2-small, 64 × 1024 tokens per step:
+
+| `--precision` | `--micro-batch-size` | tokens/s | peak GPU memory | epoch (10BT) |
+|---------------|----------------------|----------|-----------------|--------------|
+| `f32`         | 16                   | 37.0k    | 17.7 GB         | ~47 h        |
+| `tf32`        | 16                   | 48.4k    | 17.7 GB         | ~36 h        |
+| `bf16`        | 16                   | 78.4k    | 12.2 GB         | ~22 h        |
+| `bf16`        | 32                   | 68.6k    | 21.3 GB         | ~25 h        |
+
+For reference, `main` before these changes fit at most batch 4 in 24 GB and ran at ~3.9k
+tokens/s, with the GPU idle more than half the time.
+
+The three modes train the same model: 300 steps from the same seed, data and initial weights
+reach validation losses of 7.3583 / 7.3582 / 7.3582 at step 100 and 6.8632 / 6.8632 / 6.8633 at
+step 300 (`f32` / `tf32` / `bf16`).
 
 ## GPU training setup (RunPod, or any bare CUDA box)
 
