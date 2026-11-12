@@ -341,6 +341,7 @@ mod tests {
 
     #[test]
     fn test_gpt_model_output_shape() {
+        let _rng = crate::torch_rng_lock();
         let device = Default::default();
         let model = test_gpt_config(4).init::<TestBackend>(&device);
         let indices = Tensor::<TestBackend, 1, Int>::from_data([0, 1, 2, 3].as_slice(), &device)
@@ -354,6 +355,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "exceeds context size")]
     fn test_gpt_model_panics_when_sequence_exceeds_context_size() {
+        let _rng = crate::torch_rng_lock();
         let device = Default::default();
         let model = test_gpt_config(4).init::<TestBackend>(&device);
         let indices = Tensor::<TestBackend, 1, Int>::from_data([0, 1, 2, 3, 4].as_slice(), &device)
@@ -364,6 +366,7 @@ mod tests {
 
     #[test]
     fn test_multihead_attention_output_shape() {
+        let _rng = crate::torch_rng_lock();
         let device = Default::default();
 
         let batch_size = 2;
@@ -397,6 +400,7 @@ mod tests {
 
     #[test]
     fn test_multihead_attention_causal_masking() {
+        let _rng = crate::torch_rng_lock();
         let device = Default::default();
 
         let mha = MultiHeadAttentionConfig {
@@ -437,6 +441,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "d_model")]
     fn test_invalid_config_panics() {
+        let _rng = crate::torch_rng_lock();
         let device = Default::default();
         // d_model=10 is not divisible by num_heads=3 -> should panic
         MultiHeadAttentionConfig {

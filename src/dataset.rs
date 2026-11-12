@@ -44,27 +44,13 @@ pub fn load_default_fineweb_dataset() -> SqliteDataset<TextItem> {
     load_fineweb_dataset_from_disk(path)
 }
 
-/// Helper to split the dataset.
+/// Split the dataset 80/10/10 into contiguous train/validation/test ranges.
 ///
-/// `max_train_items`/`max_valid_items` optionally cap the size of the train/validation splits
-/// (taking each one's first N items) without moving the underlying 80/10/10 boundaries — the
-/// test split's start point is always the true (uncapped) validation end, so it stays fixed
-/// and non-overlapping regardless of capping.
-///
-/// The caps are in *documents*, which is what a split is made of. The `train` command takes its
-/// `--epoch-size`/`--valid-size` in batches instead — a batch being one optimizer step, which is
-/// the unit checkpoint cadence is measured in — and multiplies by `documents_per_batch` to get
-/// the numbers passed here.
-///
-/// Burn's checkpointing strategy only fires at epoch boundaries, so a full-corpus epoch (and
-/// full-corpus validation pass) on a dataset this size means waiting days for the first
-/// checkpoint; capping both to a smaller slice makes epochs (and therefore checkpoints) land at
-/// a practical cadence. The tradeoff: within a single run, every epoch reuses the same capped
-/// slices rather than sweeping fresh data.
+/// The splits are always full-size. The training loop walks the whole train split every epoch;
+/// validation is bounded separately, by evaluating only the first `--valid-batches` batches of
+/// the validation split each time it runs (see `training::train`).
 pub fn split_dataset(
     dataset: SqliteDataset<TextItem>,
-    max_train_items: Option<usize>,
-    max_valid_items: Option<usize>,
 ) -> (
     PartialDataset<Arc<SqliteDataset<TextItem>>, TextItem>,
     PartialDataset<Arc<SqliteDataset<TextItem>>, TextItem>,
@@ -73,24 +59,12 @@ pub fn split_dataset(
     let len = dataset.len();
     let arc_dataset = Arc::new(dataset);
 
-    // Define standard 80/10/10 split indices
-    let train_end_full = (len as f32 * 0.8) as usize;
-    let val_end_full = train_end_full + ((len as f32 * 0.1) as usize);
+    let train_end = (len as f32 * 0.8) as usize;
+    let val_end = train_end + ((len as f32 * 0.1) as usize);
 
-    // Optionally cap the train/validation splits; the test split boundary is unaffected.
-    let train_end = match max_train_items {
-        Some(cap) => cap.min(train_end_full),
-        None => train_end_full,
-    };
-    let val_end = match max_valid_items {
-        Some(cap) => (train_end_full + cap).min(val_end_full),
-        None => val_end_full,
-    };
-
-    // Create partial datasets using slice indices
     let train_dataset = PartialDataset::new(arc_dataset.clone(), 0, train_end);
-    let val_dataset = PartialDataset::new(arc_dataset.clone(), train_end_full, val_end);
-    let test_dataset = PartialDataset::new(arc_dataset, val_end_full, len);
+    let val_dataset = PartialDataset::new(arc_dataset.clone(), train_end, val_end);
+    let test_dataset = PartialDataset::new(arc_dataset, val_end, len);
 
     (train_dataset, val_dataset, test_dataset)
 }
@@ -179,13 +153,27 @@ impl<T: Tokenizer> TextBatcher<T> {
     }
 }
 
-impl<T: Tokenizer + Send + Sync, B: Backend> Batcher<B, TextItem, TextBatch<B>> for TextBatcher<T> {
-    fn batch(&self, items: Vec<TextItem>, device: &B::Device) -> TextBatch<B> {
+/// One batch packed on the CPU, before it is uploaded: `inputs` and `targets` are row-major
+/// `[batch_size, context_length]` token ids.
+#[derive(Clone, Debug)]
+pub struct PackedBatch {
+    pub inputs: Vec<i64>,
+    pub targets: Vec<i64>,
+}
+
+impl<T: Tokenizer> TextBatcher<T> {
+    /// Pack a pool of documents into one batch, entirely on the CPU. Split out from
+    /// [`Batcher::batch`] so the training loop's worker threads can do the tokenization and
+    /// leave only the upload to the thread that owns the GPU.
+    ///
+    /// `rng` picks where in the packed stream the batch starts; pass a seeded one to make the
+    /// batch reproducible (validation, resumed runs).
+    pub fn pack(&self, items: &[TextItem], rng: &mut impl Rng) -> PackedBatch {
         // 1. Pack every document into one flat token stream, with an end-of-text token marking
         //    each boundary so the model can learn where documents stop.
         let end_of_text = self.tokenizer.end_of_text().0 as i64;
         let mut stream: Vec<i64> = Vec::new();
-        for item in &items {
+        for item in items {
             stream.extend(self.tokenizer.encode(&item.text).iter().map(|t| t.0 as i64));
             stream.push(end_of_text);
         }
@@ -203,7 +191,7 @@ impl<T: Tokenizer + Send + Sync, B: Backend> Batcher<B, TextItem, TextBatch<B>> 
         //    varying tensor shapes this design exists to eliminate. `documents_per_batch` sizes
         //    the pool so that wrap-around stays rare (~8% of batches, duplicating <0.5% of
         //    tokens) — it is a safety net, not the normal path.
-        let start = rand::thread_rng().gen_range(0..stream.len());
+        let start = rng.gen_range(0..stream.len());
         let token_at = |offset: usize| stream[(start + offset) % stream.len()];
 
         // 3. Cut `batch_size` windows laid end to end. Each window reads one token past its own
@@ -219,14 +207,24 @@ impl<T: Tokenizer + Send + Sync, B: Backend> Batcher<B, TextItem, TextBatch<B>> 
                 targets.push(token_at(window_start + i + 1));
             }
         }
+        PackedBatch { inputs, targets }
+    }
 
-        // 4. Upload each tensor once, rather than once per sequence plus a stack. The previous
-        //    batcher uploaded every document in full and then sliced ~10% of it back out.
+    /// Upload a packed batch, once per tensor rather than once per sequence plus a stack.
+    pub fn upload<B: Backend>(&self, packed: PackedBatch, device: &B::Device) -> TextBatch<B> {
         let shape = [self.batch_size, self.context_length];
         TextBatch {
-            inputs: Tensor::<B, 1, Int>::from_data(inputs.as_slice(), device).reshape(shape),
-            targets: Tensor::<B, 1, Int>::from_data(targets.as_slice(), device).reshape(shape),
+            inputs: Tensor::<B, 1, Int>::from_data(packed.inputs.as_slice(), device).reshape(shape),
+            targets: Tensor::<B, 1, Int>::from_data(packed.targets.as_slice(), device)
+                .reshape(shape),
         }
+    }
+}
+
+impl<T: Tokenizer + Send + Sync, B: Backend> Batcher<B, TextItem, TextBatch<B>> for TextBatcher<T> {
+    fn batch(&self, items: Vec<TextItem>, device: &B::Device) -> TextBatch<B> {
+        let packed = self.pack(&items, &mut rand::thread_rng());
+        self.upload(packed, device)
     }
 }
 
