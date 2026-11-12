@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::dataset::{
-    PackedBatch, TextBatcher, TextItem, documents_per_batch, load_default_fineweb_dataset,
+    PackedBatch, TextBatch, TextBatcher, TextItem, documents_per_batch, load_default_fineweb_dataset,
     split_dataset,
 };
 use crate::loader::OrderedLoader;
@@ -310,6 +310,20 @@ fn reset_artifact_dir(artifact_dir: &str) {
         .unwrap_or_else(|err| panic!("Failed to create artifact dir '{artifact_dir}': {err}"));
 }
 
+/// Split a batch into consecutive `(inputs, targets)` micro-batches of `size` sequences.
+fn micro_batches<B: Backend>(
+    batch: TextBatch<B>,
+    size: usize,
+) -> impl Iterator<Item = (Tensor<B, 2, Int>, Tensor<B, 2, Int>)> {
+    let [batch_size, _] = batch.inputs.dims();
+    (0..batch_size).step_by(size).map(move |start| {
+        (
+            batch.inputs.clone().narrow(0, start, size),
+            batch.targets.clone().narrow(0, start, size),
+        )
+    })
+}
+
 /// Mean loss over the (pre-packed) validation batches.
 fn validate<B: FusedOps, T: Tokenizer>(
     model: &GPTModel<B>,
@@ -323,13 +337,8 @@ fn validate<B: FusedOps, T: Tokenizer>(
     let mut count = 0usize;
     for packed in batches {
         let batch = batcher.upload::<B>(packed.clone(), device);
-        let [batch_size, _] = batch.inputs.dims();
-        for start in (0..batch_size).step_by(micro_batch_size) {
-            let loss = model.loss(
-                batch.inputs.clone().narrow(0, start, micro_batch_size),
-                batch.targets.clone().narrow(0, start, micro_batch_size),
-                precision,
-            );
+        for (inputs, targets) in micro_batches(batch, micro_batch_size) {
+            let loss = model.loss(inputs, targets, precision);
             count += 1;
             total = Some(match total {
                 Some(t) => t + loss,
@@ -548,13 +557,8 @@ pub fn train<B: FusedAutodiffBackend, T, D: Dataset<TextItem> + 'static>(
             // Gradient accumulation over micro-batches. Each micro-batch's mean loss is scaled
             // by 1 / micro_steps, so the summed gradients are those of the whole batch's mean.
             let mut accumulator = GradientsAccumulator::new();
-            for micro in 0..micro_steps {
-                let start = micro * micro_batch_size;
-                let loss = model.loss(
-                    batch.inputs.clone().narrow(0, start, micro_batch_size),
-                    batch.targets.clone().narrow(0, start, micro_batch_size),
-                    precision,
-                ) / micro_steps as f64;
+            for (inputs, targets) in micro_batches(batch, micro_batch_size) {
+                let loss = model.loss(inputs, targets, precision) / micro_steps as f64;
 
                 // Accumulate on the device: reading the loss back every step would make the CPU
                 // wait for the GPU to drain each step before it could queue the next one.
@@ -846,6 +850,31 @@ mod tests {
         assert_eq!(state(artifact_dir).global_step, 4);
 
         std::fs::remove_dir_all(artifact_dir).ok();
+    }
+
+    /// bf16 mixed precision and micro-batching run end to end (on CPU here) and land close to
+    /// the f32 result: same seed, same batches, only the matmul precision differs.
+    #[test]
+    fn test_bf16_micro_batched_training_tracks_f32() {
+        let f32_dir = std::env::temp_dir().join("llm-from-scratch-test-precision-f32");
+        let bf16_dir = std::env::temp_dir().join("llm-from-scratch-test-precision-bf16");
+        let (f32_dir, bf16_dir) = (f32_dir.to_str().unwrap(), bf16_dir.to_str().unwrap());
+        let options = RunOptions { eval_every: 100, overwrite: true, ..RunOptions::default() };
+
+        run(f32_dir, tiny_config(), options.clone());
+        run(
+            bf16_dir,
+            tiny_config(),
+            RunOptions { precision: Precision::Bf16, micro_batch_size: Some(1), ..options },
+        );
+
+        let (a, b) = (checkpoint_logits(f32_dir), checkpoint_logits(bf16_dir));
+        let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        assert!(max_diff < 0.05, "bf16 drifted from f32 by {max_diff}");
+        assert!(max_diff > 0.0, "bf16 run should not be bit-identical to f32");
+
+        std::fs::remove_dir_all(f32_dir).ok();
+        std::fs::remove_dir_all(bf16_dir).ok();
     }
 
     /// Forgetting `--resume` must not wipe a run's checkpoint.

@@ -18,7 +18,8 @@ use crate::ops::{FusedOps, causal_attention};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Precision {
-    /// Plain f32 everywhere: bit-for-bit what the model computed before this option existed.
+    /// Plain f32 everywhere. The same math as before this option existed, though not the same
+    /// bits: attention and the loss now run as fused kernels, which round differently.
     #[default]
     F32,
     /// f32 tensors, but cuBLAS may run f32 matmuls on TF32 tensor cores (10-bit mantissa
@@ -50,6 +51,14 @@ impl Precision {
             // SAFETY: called at startup, before any other thread exists.
             unsafe { std::env::set_var("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1") };
         }
+    }
+}
+
+/// Cast to the compute dtype (no-op in f32 modes, and for a tensor already in that dtype).
+fn to_compute<B: Backend, const D: usize>(x: Tensor<B, D>, precision: Precision) -> Tensor<B, D> {
+    match precision.compute_dtype() {
+        None => x,
+        Some(dtype) => x.cast(dtype),
     }
 }
 
@@ -270,6 +279,9 @@ impl<B: FusedOps> MultiHeadAttention<B> {
         let [batch_size, seq_len, _d_model] = sequence.dims();
 
         // Compute Q, K, V
+        // Cast once here rather than inside each of the three projections (casting a tensor
+        // that is already bf16 is a no-op).
+        let sequence = to_compute(sequence, precision);
         // Note: it's fine to clone tensors in burn, it's just a shallow clone
         let keys = linear_lowp(&self.key_weights, sequence.clone(), precision);
         let values = linear_lowp(&self.value_weights, sequence.clone(), precision);
