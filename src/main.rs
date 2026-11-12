@@ -28,7 +28,7 @@ use crate::dataset::{
     TextBatch, TextBatcher, documents_per_batch, load_default_fineweb_dataset, split_dataset,
 };
 use crate::model::{
-    EmbeddingModuleConfig, GPTModel, GPTModelConfig, MultiHeadAttentionConfig,
+    EmbeddingModuleConfig, GPTModel, GPTModelConfig, MultiHeadAttentionConfig, Precision,
     TransformerBlockConfig,
 };
 use crate::tokenizer::{AnyTokenizer, BpeTokenizer, SimpleTokenizer, Token, Tokenizer, TokenizerKind};
@@ -52,6 +52,7 @@ use burn::tensor::activation;
 mod dataset;
 mod loader;
 mod model;
+mod ops;
 mod tokenizer;
 mod training;
 
@@ -170,6 +171,16 @@ enum Commands {
         /// Start fresh even though --artifact-dir holds a checkpoint, deleting it.
         #[arg(long, conflicts_with = "resume")]
         overwrite: bool,
+        /// Matmul precision. `f32`: exact, the reference. `tf32`: f32 tensors, TF32 tensor-core
+        /// matmuls. `bf16`: autocast-style mixed precision (bf16 matmuls and attention, f32
+        /// master weights, optimizer, norms and loss).
+        #[arg(long, value_enum, default_value_t = Precision::F32)]
+        precision: Precision,
+        /// Sequences per forward/backward pass; must divide --batch-size. Gradients are
+        /// accumulated so each optimizer step still covers --batch-size sequences. Lower it if
+        /// a batch doesn't fit in GPU memory.
+        #[arg(long)]
+        micro_batch_size: Option<usize>,
         /// Number of background dataloader worker threads.
         #[arg(long, default_value_t = NUM_WORKERS)]
         num_workers: usize,
@@ -355,6 +366,9 @@ struct TrainArgs {
 fn run_train(args: TrainArgs) {
     type MyBackend = LibTorch<f32>;
     type MyAutodiffBackend = Autodiff<MyBackend>;
+
+    // Before anything touches CUDA.
+    args.options.precision.configure_process();
 
     let config = if args.options.resume {
         // A resumed run *is* the original run: same model, optimizer, tokenizer and batch shape.
@@ -654,6 +668,8 @@ fn main() {
             max_steps,
             resume,
             overwrite,
+            precision,
+            micro_batch_size,
             num_workers,
             tokenizer,
             tokenizer_path,
@@ -677,6 +693,8 @@ fn main() {
                 max_steps,
                 resume,
                 overwrite,
+                precision,
+                micro_batch_size,
             },
         }),
         Commands::InspectBatch {
