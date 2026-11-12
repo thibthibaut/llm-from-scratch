@@ -81,8 +81,14 @@ comparable) and writes, under `--artifact-dir` (default `artifacts/`):
 - `metrics.csv` — train loss every `--log-every` steps, validation loss at each evaluation.
 
 `--resume` continues from `checkpoint/` at the exact batch it stopped on, using the settings in
-the saved `config.json`. `--max-steps` stops early (after a checkpoint), which is handy for
-benchmarks.
+the saved `config.json` (pass `--num-epochs` to change the epoch count). It refuses to resume
+against a different train split or batch size, since that would silently train on other
+documents. A fresh run refuses to start in a directory that holds a checkpoint unless given
+`--overwrite`, so forgetting `--resume` can't delete a day of training. `--max-steps` stops
+early (after a checkpoint), which is handy for benchmarks.
+
+Checkpoints are written to `checkpoint.tmp/`, flushed, and only then swapped into place, so a
+crash at any point leaves a complete checkpoint that `--resume` finds.
 
 ## GPU training setup (RunPod, or any bare CUDA box)
 

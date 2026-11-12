@@ -10,8 +10,13 @@
 //!
 //! Workers only tokenize and pack on the CPU. The tensors are uploaded by the thread that
 //! consumes the iterator (see `TextBatcher::upload`).
+//!
+//! A worker that panics (an SQLite read error, a tokenizer bug) reports it to the consumer,
+//! which re-panics with the message. Without that, the remaining workers would fill the
+//! prefetch window and wait forever for a batch that will never come, hanging the run.
 
 use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -25,8 +30,11 @@ use rand::rngs::StdRng;
 use crate::dataset::{PackedBatch, TextBatcher, TextItem};
 use crate::tokenizer::Tokenizer;
 
+/// What a worker sends: a built batch, or why it couldn't build one.
+type WorkerResult = Result<(usize, PackedBatch), String>;
+
 pub struct OrderedLoader {
-    receiver: Option<mpsc::Receiver<(usize, PackedBatch)>>,
+    receiver: Option<mpsc::Receiver<WorkerResult>>,
     workers: Vec<thread::JoinHandle<()>>,
     /// Batches that arrived before the one the iterator is waiting for.
     pending: BTreeMap<usize, PackedBatch>,
@@ -88,14 +96,26 @@ impl OrderedLoader {
                             if stop.load(Ordering::Relaxed) {
                                 return;
                             }
-                            let first = index * docs_per_batch;
-                            let items: Vec<TextItem> = (first..first + docs_per_batch)
-                                .map(|i| dataset.get(i).expect("batch index within dataset"))
-                                .collect();
-                            let mut rng = StdRng::seed_from_u64(seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-                            let packed = batcher.pack(&items, &mut rng);
-                            if sender.send((index, packed)).is_err() {
-                                return; // consumer dropped
+                            let built = catch_unwind(AssertUnwindSafe(|| {
+                                let first = index * docs_per_batch;
+                                let items: Vec<TextItem> = (first..first + docs_per_batch)
+                                    .map(|i| dataset.get(i).expect("batch index within dataset"))
+                                    .collect();
+                                let mut rng = StdRng::seed_from_u64(
+                                    seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                                );
+                                batcher.pack(&items, &mut rng)
+                            }));
+                            let message = match built {
+                                Ok(packed) => Ok((index, packed)),
+                                Err(payload) => Err(format!(
+                                    "loader worker {worker} panicked building batch {index}: {}",
+                                    panic_message(&*payload)
+                                )),
+                            };
+                            let failed = message.is_err();
+                            if sender.send(message).is_err() || failed {
+                                return; // consumer dropped, or this worker is done for
                             }
                         }
                     })
@@ -133,14 +153,27 @@ impl Iterator for OrderedLoader {
             if let Some(batch) = self.pending.remove(&self.next) {
                 break batch;
             }
-            let (index, batch) = receiver.recv().expect("loader workers exited early");
-            self.pending.insert(index, batch);
+            match receiver.recv() {
+                Ok(Ok((index, batch))) => {
+                    self.pending.insert(index, batch);
+                }
+                Ok(Err(message)) => panic!("{message}"),
+                Err(_) => panic!("loader workers exited before producing batch {}", self.next),
+            }
         };
         let index = self.next;
         self.next += 1;
         self.consumed.store(self.next, Ordering::Relaxed);
         Some((index, batch))
     }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
 }
 
 impl Drop for OrderedLoader {
@@ -223,6 +256,29 @@ mod tests {
                 assert!(t == 1 || (4 * index..4 * index + 4).contains(&doc), "batch {index} got token {t}");
             }
         }
+    }
+
+    /// A dataset whose document 9 can't be read, like an SQLite error inside `get`.
+    struct FailingDataset;
+
+    impl Dataset<TextItem> for FailingDataset {
+        fn get(&self, index: usize) -> Option<TextItem> {
+            assert!(index != 9, "simulated read error at document {index}");
+            Some(TextItem { text: word(index) })
+        }
+        fn len(&self) -> usize {
+            40
+        }
+    }
+
+    /// A worker panic must surface in the consumer, not leave it waiting forever on a batch
+    /// that will never arrive while the other workers sit in the full prefetch window.
+    #[test]
+    #[should_panic(expected = "simulated read error at document 9")]
+    fn worker_panic_propagates_instead_of_hanging() {
+        let batcher = TextBatcher::new(tokenizer(), 2, 1);
+        let loader = OrderedLoader::new(Arc::new(FailingDataset), batcher, 4, 0, 10, 7, 4, 4);
+        for _ in loader {}
     }
 
     #[test]

@@ -55,6 +55,15 @@ mod model;
 mod tokenizer;
 mod training;
 
+/// Held by every test that draws from libtorch's global random generator (model init, random
+/// tensors). Tests run in parallel, and a test that seeds the generator and compares two
+/// training runs needs nothing else drawing from it in between.
+#[cfg(test)]
+pub fn torch_rng_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 const VOCAB_PATH: &str = "vocab.json";
 const TOKENIZER_PATH: &str = "tokenizer.json";
 
@@ -139,9 +148,9 @@ enum Commands {
         /// Device to train on: `cpu`, `cuda` (or `cuda:N`), `mps`, `vulkan`.
         #[arg(long, default_value = "cpu", value_parser = parse_device)]
         device: LibTorchDevice,
-        /// Number of full passes over the train split.
-        #[arg(long, default_value_t = NUM_EPOCHS)]
-        num_epochs: usize,
+        /// Number of full passes over the train split [default: 1; on --resume, the run's own].
+        #[arg(long)]
+        num_epochs: Option<usize>,
         /// Validate, save `model`/`best-model` and write a resumable checkpoint every N steps.
         #[arg(long, default_value_t = EVAL_EVERY)]
         eval_every: usize,
@@ -158,6 +167,9 @@ enum Commands {
         /// come from `<artifact-dir>/config.json`; the architecture flags are ignored.
         #[arg(long)]
         resume: bool,
+        /// Start fresh even though --artifact-dir holds a checkpoint, deleting it.
+        #[arg(long, conflicts_with = "resume")]
+        overwrite: bool,
         /// Number of background dataloader worker threads.
         #[arg(long, default_value_t = NUM_WORKERS)]
         num_workers: usize,
@@ -331,7 +343,7 @@ struct TrainArgs {
     context_length: usize,
     batch_size: usize,
     device: LibTorchDevice,
-    num_epochs: usize,
+    num_epochs: Option<usize>,
     num_workers: usize,
     tokenizer_kind: TokenizerKind,
     tokenizer_path: Option<String>,
@@ -350,7 +362,10 @@ fn run_train(args: TrainArgs) {
         let config = TrainingConfig::load(&path)
             .unwrap_or_else(|err| panic!("--resume: cannot load {path}: {err}"));
         println!("Resuming with the settings in {path}; architecture flags are ignored");
-        config.with_num_epochs(args.num_epochs)
+        match args.num_epochs {
+            Some(num_epochs) => config.with_num_epochs(num_epochs),
+            None => config,
+        }
     } else {
         // Load the tokenizer up front purely to size the embedding and output head. The training
         // run reloads it from the config, so there is exactly one place that decides which
@@ -368,7 +383,7 @@ fn run_train(args: TrainArgs) {
         );
         TrainingConfig::new(gpt_config, AdamWConfig::new())
             .with_batch_size(args.batch_size)
-            .with_num_epochs(args.num_epochs)
+            .with_num_epochs(args.num_epochs.unwrap_or(NUM_EPOCHS))
             .with_num_workers(args.num_workers)
             .with_tokenizer_kind(Some(args.tokenizer_kind))
             .with_tokenizer_path(Some(tokenizer_path))
@@ -420,8 +435,7 @@ fn run_inspect_batch(
     let targets_data = batch.targets.into_data().to_vec::<i64>().unwrap();
 
     println!(
-        "Inspected batch: actual_batch_size={}, seq_len={} (capped by context_size={})",
-        actual_batch_size, seq_len, context_size
+        "Inspected batch: actual_batch_size={actual_batch_size}, seq_len={seq_len}"
     );
     println!();
 
@@ -639,6 +653,7 @@ fn main() {
             log_every,
             max_steps,
             resume,
+            overwrite,
             num_workers,
             tokenizer,
             tokenizer_path,
@@ -661,6 +676,7 @@ fn main() {
                 log_every,
                 max_steps,
                 resume,
+                overwrite,
             },
         }),
         Commands::InspectBatch {

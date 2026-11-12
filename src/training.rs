@@ -106,6 +106,9 @@ pub struct RunOptions {
     pub max_steps: Option<usize>,
     /// Continue from `<artifact_dir>/checkpoint` instead of starting fresh.
     pub resume: bool,
+    /// Allow a fresh run to wipe an artifact dir that holds a checkpoint. Without it, a
+    /// forgotten `--resume` would silently delete a run's checkpoint.
+    pub overwrite: bool,
 }
 
 impl Default for RunOptions {
@@ -116,6 +119,7 @@ impl Default for RunOptions {
             log_every: 50,
             max_steps: None,
             resume: false,
+            overwrite: false,
         }
     }
 }
@@ -130,6 +134,14 @@ struct TrainState {
     /// Optimizer steps since the start of the run.
     global_step: usize,
     best_valid_loss: Option<f64>,
+    /// What `batch_in_epoch` indexes into: the epoch's batch → documents mapping depends on
+    /// the train split's size and the documents per batch. A resume against a different split
+    /// (another DB, other batch settings) would silently train on other documents, so these are
+    /// checked on `--resume`. `Option` so checkpoints written before they existed still load.
+    #[serde(default)]
+    train_documents: Option<usize>,
+    #[serde(default)]
+    docs_per_batch: Option<usize>,
 }
 
 type CheckpointRecorder = NamedMpkFileRecorder<FullPrecisionSettings>;
@@ -138,17 +150,53 @@ fn checkpoint_dir(artifact_dir: &str) -> PathBuf {
     Path::new(artifact_dir).join("checkpoint")
 }
 
-/// Write model + optimizer + loop state for `--resume`, atomically: everything goes into a
-/// scratch directory that is renamed over the previous checkpoint once complete, so a crash
-/// mid-write never leaves a half-written checkpoint behind.
+/// The directories a checkpoint can be in, most authoritative first. `checkpoint.tmp` and
+/// `checkpoint.old` only hold the latest complete checkpoint if a crash interrupted the
+/// renames at the end of `save_checkpoint`; `state.json` is written last, so its presence
+/// marks a complete one.
+fn checkpoint_candidates(artifact_dir: &str) -> [PathBuf; 3] {
+    let dir = Path::new(artifact_dir);
+    [dir.join("checkpoint"), dir.join("checkpoint.tmp"), dir.join("checkpoint.old")]
+}
+
+fn find_checkpoint(artifact_dir: &str) -> Option<PathBuf> {
+    checkpoint_candidates(artifact_dir)
+        .into_iter()
+        .find(|dir| dir.join("state.json").exists())
+}
+
+/// Flush every file in `dir`, and `dir` itself, to disk.
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        fs::File::open(entry?.path())?.sync_all()?;
+    }
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Save `model` to `<artifact_dir>/<name>.mpk` without ever leaving a truncated file there.
+fn save_model_atomically<B: Backend>(model: &GPTModel<B>, artifact_dir: &str, name: &str) {
+    let dir = Path::new(artifact_dir);
+    model
+        .clone()
+        // Not `{name}.tmp`: the recorder replaces the extension rather than appending one.
+        .save_file(dir.join(format!("{name}-tmp")), &CompactRecorder::new())
+        .unwrap_or_else(|err| panic!("save {name}: {err}"));
+    fs::rename(dir.join(format!("{name}-tmp.mpk")), dir.join(format!("{name}.mpk")))
+        .unwrap_or_else(|err| panic!("move {name} into place: {err}"));
+}
+
+/// Write model + optimizer + loop state for `--resume`. Everything goes into
+/// `checkpoint.tmp/` (state.json last) and is flushed; only then is the previous checkpoint
+/// moved aside to `checkpoint.old/`, the new one renamed into place, and the old one deleted.
+/// At every instant one of the three directories holds a complete checkpoint, and
+/// `find_checkpoint` knows where to look.
 fn save_checkpoint<B: AutodiffBackend, O: Optimizer<GPTModel<B>, B>>(
     artifact_dir: &str,
     model: &GPTModel<B>,
     optim: &O,
     state: &TrainState,
 ) {
-    let dir = checkpoint_dir(artifact_dir);
-    let tmp = Path::new(artifact_dir).join("checkpoint.tmp");
+    let [dir, tmp, old] = checkpoint_candidates(artifact_dir);
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp).expect("create checkpoint dir");
     let recorder = CheckpointRecorder::new();
@@ -164,8 +212,14 @@ fn save_checkpoint<B: AutodiffBackend, O: Optimizer<GPTModel<B>, B>>(
         serde_json::to_string_pretty(state).unwrap(),
     )
     .expect("save loop state");
-    let _ = fs::remove_dir_all(&dir);
+    fsync_dir(&tmp).expect("flush checkpoint to disk");
+
+    let _ = fs::remove_dir_all(&old);
+    if dir.exists() {
+        fs::rename(&dir, &old).expect("move previous checkpoint aside");
+    }
     fs::rename(&tmp, &dir).expect("move checkpoint into place");
+    let _ = fs::remove_dir_all(&old);
 }
 
 fn load_checkpoint<B: AutodiffBackend, O: Optimizer<GPTModel<B>, B>>(
@@ -174,7 +228,11 @@ fn load_checkpoint<B: AutodiffBackend, O: Optimizer<GPTModel<B>, B>>(
     optim: O,
     device: &B::Device,
 ) -> (GPTModel<B>, O, TrainState) {
-    let dir = checkpoint_dir(artifact_dir);
+    let dir = find_checkpoint(artifact_dir)
+        .unwrap_or_else(|| panic!("--resume: no checkpoint in '{artifact_dir}'"));
+    if dir != checkpoint_dir(artifact_dir) {
+        println!("Resuming from {} (the last save was interrupted)", dir.display());
+    }
     let recorder = CheckpointRecorder::new();
     let model = model
         .load_file(dir.join("model"), &recorder, device)
@@ -197,12 +255,27 @@ struct MetricsLog {
 }
 
 impl MetricsLog {
-    fn new(artifact_dir: &str) -> Self {
+    const HEADER: &str = "step,epoch,tokens,split,loss,tokens_per_sec";
+
+    /// Open (or create) the log. On a resume, rows past `resume_step` are dropped: they were
+    /// logged after the checkpoint being resumed from and are about to be logged again.
+    fn new(artifact_dir: &str, resume_step: Option<usize>) -> Self {
         let path = Path::new(artifact_dir).join("metrics.csv");
-        if !path.exists() {
-            fs::write(&path, "step,epoch,tokens,split,loss,tokens_per_sec\n")
-                .expect("create metrics.csv");
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        let kept: Vec<&str> = existing
+            .lines()
+            .skip(1)
+            .filter(|row| {
+                let step = row.split(',').next().and_then(|s| s.parse::<usize>().ok());
+                matches!((step, resume_step), (Some(step), Some(resume)) if step <= resume)
+            })
+            .collect();
+        let mut contents = format!("{}\n", Self::HEADER);
+        for row in kept {
+            contents.push_str(row);
+            contents.push('\n');
         }
+        fs::write(&path, contents).expect("write metrics.csv");
         Self { path }
     }
 
@@ -272,15 +345,21 @@ pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
 {
     if options.resume {
         assert!(
-            checkpoint_dir(artifact_dir).join("state.json").exists(),
-            "--resume: no checkpoint in '{artifact_dir}/checkpoint'"
+            find_checkpoint(artifact_dir).is_some(),
+            "--resume: no checkpoint in '{artifact_dir}'"
         );
     } else {
+        assert!(
+            options.overwrite || find_checkpoint(artifact_dir).is_none(),
+            "'{artifact_dir}' holds a training checkpoint. Pass --resume to continue that run, \
+             or --overwrite to delete it and start over."
+        );
         reset_artifact_dir(artifact_dir);
-        config
-            .save(format!("{artifact_dir}/config.json"))
-            .expect("Config should be saved successfully");
     }
+    // Rewritten on resume too, so it always describes the run (e.g. a changed --num-epochs).
+    config
+        .save(format!("{artifact_dir}/config.json"))
+        .expect("Config should be saved successfully");
 
     B::seed(&device, config.seed);
 
@@ -299,10 +378,13 @@ pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
         "train split ({} documents) is smaller than one batch ({docs_per_batch} documents)",
         train_dataset.len()
     );
-    let valid_batches = options
-        .valid_batches
-        .min(OrderedLoader::num_batches(valid_dataset.len(), docs_per_batch))
-        .max(1);
+    let available_valid_batches = OrderedLoader::num_batches(valid_dataset.len(), docs_per_batch);
+    assert!(
+        available_valid_batches > 0,
+        "validation split ({} documents) is smaller than one batch ({docs_per_batch} documents)",
+        valid_dataset.len()
+    );
+    let valid_batches = options.valid_batches.min(available_valid_batches);
     let total_steps = (steps_per_epoch * config.num_epochs)
         .min(options.max_steps.unwrap_or(usize::MAX));
     let num_workers = config.num_workers.max(1);
@@ -333,16 +415,41 @@ pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
     let optim = config.optimizer.init::<B, GPTModel<B>>();
     let (mut model, mut optim, mut state) = if options.resume {
         let (model, optim, state) = load_checkpoint(artifact_dir, model, optim, &device);
+        let check = |what: &str, saved: Option<usize>, now: usize| {
+            if let Some(saved) = saved {
+                assert_eq!(
+                    saved, now,
+                    "--resume: the checkpoint was taken with {what} = {saved}, but it is now \
+                     {now}. Resuming would train on different documents than the interrupted \
+                     run; use the same dataset and batch settings."
+                );
+            }
+        };
+        check("train documents", state.train_documents, train_dataset.len());
+        check("documents per batch", state.docs_per_batch, docs_per_batch);
+        assert!(
+            state.batch_in_epoch < steps_per_epoch,
+            "--resume: checkpoint is at batch {} of an epoch of {steps_per_epoch} batches",
+            state.batch_in_epoch
+        );
         println!(
             "Resuming at step {} (epoch {}, batch {}/{steps_per_epoch})",
             state.global_step, state.epoch, state.batch_in_epoch
         );
         (model, optim, state)
     } else {
-        (model, optim, TrainState::default())
+        let state = TrainState {
+            train_documents: Some(train_dataset.len()),
+            docs_per_batch: Some(docs_per_batch),
+            ..TrainState::default()
+        };
+        (model, optim, state)
     };
+    // Checkpoints from before these fields existed get them filled in from here on.
+    state.train_documents = Some(train_dataset.len());
+    state.docs_per_batch = Some(docs_per_batch);
 
-    let metrics = MetricsLog::new(artifact_dir);
+    let metrics = MetricsLog::new(artifact_dir, options.resume.then_some(state.global_step));
     let run_start = Instant::now();
     let run_start_step = state.global_step;
 
@@ -367,15 +474,9 @@ pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
         );
         if improved {
             state.best_valid_loss = Some(valid_loss);
-            model
-                .clone()
-                .save_file(format!("{artifact_dir}/best-model"), &CompactRecorder::new())
-                .expect("save best model");
+            save_model_atomically(model, artifact_dir, "best-model");
         }
-        model
-            .clone()
-            .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
-            .expect("save model");
+        save_model_atomically(model, artifact_dir, "model");
         save_checkpoint(artifact_dir, model, optim, state);
     };
 
@@ -575,6 +676,7 @@ mod tests {
     }
 
     fn run(artifact_dir: &str, config: TrainingConfig, options: RunOptions) {
+        let _rng = crate::torch_rng_lock();
         train::<TestBackend, _, _>(
             artifact_dir,
             config,
@@ -598,7 +700,7 @@ mod tests {
         let artifact_dir = std::env::temp_dir().join("llm-from-scratch-test-train-smoke");
         let artifact_dir = artifact_dir.to_str().unwrap();
 
-        run(artifact_dir, tiny_config(), RunOptions { eval_every: 3, ..RunOptions::default() });
+        run(artifact_dir, tiny_config(), RunOptions { eval_every: 3, overwrite: true, ..RunOptions::default() });
 
         for file in ["model.mpk", "best-model.mpk", "config.json", "metrics.csv"] {
             assert!(
@@ -621,7 +723,7 @@ mod tests {
         let artifact_dir = artifact_dir.to_str().unwrap();
         let options = RunOptions { eval_every: 100, ..RunOptions::default() };
 
-        run(artifact_dir, tiny_config().with_num_epochs(2), RunOptions { max_steps: Some(3), ..options.clone() });
+        run(artifact_dir, tiny_config().with_num_epochs(2), RunOptions { max_steps: Some(3), overwrite: true, ..options.clone() });
         let first = state(artifact_dir);
         assert_eq!((first.epoch, first.batch_in_epoch, first.global_step), (0, 3, 3));
 
@@ -630,6 +732,80 @@ mod tests {
         assert_eq!((second.epoch, second.global_step), (2, 8));
 
         std::fs::remove_dir_all(artifact_dir).ok();
+    }
+
+    /// Logits of the checkpointed model on a fixed input, to compare two runs' weights.
+    fn checkpoint_logits(artifact_dir: &str) -> Vec<f32> {
+        let device = Default::default();
+        let model = tiny_config()
+            .model
+            .init::<TestBackend>(&device)
+            .load_file(
+                format!("{artifact_dir}/checkpoint/model"),
+                &CheckpointRecorder::new(),
+                &device,
+            )
+            .unwrap();
+        let input = Tensor::<TestBackend, 1, Int>::from_data([2, 3, 4, 5].as_slice(), &device)
+            .reshape([1, 4]);
+        model.forward(input).into_data().to_vec::<f32>().unwrap()
+    }
+
+    /// Stop-and-resume must end at the *same weights* as an uninterrupted run, not just the
+    /// same step counter: same batches, same AdamW state, same epoch boundaries.
+    #[test]
+    fn test_resumed_run_matches_uninterrupted_run() {
+        let straight = std::env::temp_dir().join("llm-from-scratch-test-resume-straight");
+        let split = std::env::temp_dir().join("llm-from-scratch-test-resume-split");
+        let (straight, split) = (straight.to_str().unwrap(), split.to_str().unwrap());
+        let config = || tiny_config().with_num_epochs(2);
+        let options = RunOptions { eval_every: 100, overwrite: true, ..RunOptions::default() };
+
+        run(straight, config(), options.clone());
+        run(split, config(), RunOptions { max_steps: Some(5), ..options.clone() });
+        run(split, config(), RunOptions { resume: true, overwrite: false, ..options });
+
+        assert_eq!(checkpoint_logits(straight), checkpoint_logits(split));
+        // The resumed run's metrics have one row per logged step, no duplicates.
+        let metrics = std::fs::read_to_string(format!("{split}/metrics.csv")).unwrap();
+        let valid_rows = metrics.lines().filter(|l| l.contains(",valid,")).count();
+        assert_eq!(valid_rows, 2, "evaluations at step 5 and at the end:\n{metrics}");
+
+        std::fs::remove_dir_all(straight).ok();
+        std::fs::remove_dir_all(split).ok();
+    }
+
+    /// A crash between the renames at the end of `save_checkpoint` leaves the latest complete
+    /// checkpoint in `checkpoint.tmp/` (or `checkpoint.old/`); `--resume` must find it.
+    #[test]
+    fn test_resume_finds_checkpoint_left_by_interrupted_save() {
+        let artifact_dir = std::env::temp_dir().join("llm-from-scratch-test-resume-interrupted");
+        let artifact_dir = artifact_dir.to_str().unwrap();
+        let options = RunOptions { eval_every: 100, ..RunOptions::default() };
+
+        run(artifact_dir, tiny_config(), RunOptions { max_steps: Some(2), overwrite: true, ..options.clone() });
+        std::fs::rename(
+            format!("{artifact_dir}/checkpoint"),
+            format!("{artifact_dir}/checkpoint.tmp"),
+        )
+        .unwrap();
+
+        run(artifact_dir, tiny_config(), RunOptions { resume: true, ..options });
+        assert_eq!(state(artifact_dir).global_step, 4);
+
+        std::fs::remove_dir_all(artifact_dir).ok();
+    }
+
+    /// Forgetting `--resume` must not wipe a run's checkpoint.
+    #[test]
+    #[should_panic(expected = "holds a training checkpoint")]
+    fn test_fresh_run_refuses_to_delete_a_checkpoint() {
+        let artifact_dir = std::env::temp_dir().join("llm-from-scratch-test-refuse-overwrite");
+        let artifact_dir = artifact_dir.to_str().unwrap();
+        let options = RunOptions { eval_every: 100, ..RunOptions::default() };
+
+        run(artifact_dir, tiny_config(), RunOptions { max_steps: Some(1), overwrite: true, ..options.clone() });
+        run(artifact_dir, tiny_config(), options);
     }
 }
 
