@@ -114,6 +114,7 @@ cat > .envrc <<'EOF'
 export CARGO_TARGET_DIR=/root/build/llm-from-scratch-target
 export TORCH_CUDA_VERSION=cu128
 export RUSTFLAGS="-C target-cpu=native"
+export FINEWEB_DB=/workspace/HuggingFaceFWfineweb-edu-sample-10BT.db
 EOF
 direnv allow .envrc
 ```
@@ -143,10 +144,23 @@ cargo build --release
 
 ### Dataset
 
-The training/vocab code loads the fineweb-edu dataset directly from
-`~/.cache/burn-dataset/HuggingFaceFWfineweb-edu-sample-10BT.db` (see
-`default_fineweb_dataset_path()` in `src/dataset.rs`) — this path is currently hardcoded, not
-configurable via a flag.
+The training/vocab code reads fineweb-edu from a SQLite file: `$FINEWEB_DB` if set, otherwise
+`/workspace/HuggingFaceFWfineweb-edu-sample-10BT.db` (see `default_fineweb_dataset_path()` in
+`src/dataset.rs`).
+
+Build it straight from the Hugging Face Hub with:
+
+```bash
+HF_HOME=/mnt/data/vlm-study/fineweb-edu/hf_home \
+  uv run scripts/build_fineweb_db.py --output /mnt/data/vlm-study/fineweb-edu/fineweb-edu-sample-10BT.db
+export FINEWEB_DB=/mnt/data/vlm-study/fineweb-edu/fineweb-edu-sample-10BT.db
+```
+
+The script downloads one parquet shard at a time, appends its `text` column to the `train`
+table and deletes the shard, so disk usage peaks at the database plus one ~2GB shard — unlike
+burn's `HuggingfaceDatasetLoader`, which keeps the parquet download and an Arrow cache alongside
+the database. `HF_HOME` keeps the Hub client's own cache off a small root disk. The script is
+resumable: imported shards are recorded and skipped on a rerun.
 
 To move the ~56GB file to a pod: compress locally first (zstd -3 gets ~3x, cutting transfer
 time roughly 3x too), transfer, decompress remotely:
