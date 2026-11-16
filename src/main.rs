@@ -7,7 +7,9 @@
 //!   train a byte-level BPE tokenizer on the dataset's train split and write it to
 //!   `tokenizer.json`.
 //! - `train [--d-model N] [--num-heads N] [--num-layers N] [--context-length N] [--batch-size N]
-//!   [--tokenizer simple|bpe] [--tokenizer-path PATH]`: train the GPT model. The tokenizer
+//!   [--num-epochs N] [--eval-every N] [--valid-batches N] [--max-steps N] [--resume]
+//!   [--tokenizer simple|bpe] [--tokenizer-path PATH]`: train the GPT model over full epochs of
+//!   the train split, validating and checkpointing every `--eval-every` steps. The tokenizer
 //!   choice is recorded in `artifacts/config.json`.
 //! - `inspect-batch [--batch-size N] [--context-size N]`: initialize the dataloader,
 //!   generate a single batch, detokenize it and display it.
@@ -30,7 +32,7 @@ use crate::model::{
     TransformerBlockConfig,
 };
 use crate::tokenizer::{AnyTokenizer, BpeTokenizer, SimpleTokenizer, Token, Tokenizer, TokenizerKind};
-use crate::training::TrainingConfig;
+use crate::training::{RunOptions, TrainingConfig};
 
 use burn::Tensor;
 use burn::backend::Autodiff;
@@ -48,9 +50,19 @@ use burn::tensor::Int;
 use burn::tensor::activation;
 
 mod dataset;
+mod loader;
 mod model;
 mod tokenizer;
 mod training;
+
+/// Held by every test that draws from libtorch's global random generator (model init, random
+/// tensors). Tests run in parallel, and a test that seeds the generator and compares two
+/// training runs needs nothing else drawing from it in between.
+#[cfg(test)]
+pub fn torch_rng_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 const VOCAB_PATH: &str = "vocab.json";
 const TOKENIZER_PATH: &str = "tokenizer.json";
@@ -74,18 +86,14 @@ const NUM_HEADS: usize = 12;
 const NUM_LAYERS: usize = 12;
 const CONTEXT_LENGTH: usize = 1024;
 const BATCH_SIZE: usize = 64;
-// Burn's checkpointing strategy only fires at epoch boundaries, so a full-corpus epoch on a
-// multi-million-row dataset means waiting days for the first checkpoint. Cap the epoch to a
-// fixed number of optimizer steps instead; see `split_dataset` for the tradeoff this makes.
-// 300 steps at the default batch size is ~19.7M tokens, i.e. a checkpoint every few minutes.
-const EPOCH_BATCHES: usize = 300;
-// Validation runs every epoch too, so it needs the same kind of cap — otherwise it's the full
-// (uncapped) 10% validation split running against a training epoch that's now a small slice of
-// the corpus. Keeps EPOCH_BATCHES' 10:1 train/valid ratio.
+// One epoch is a full pass over the train split (~150k steps at the default batch size on
+// fineweb-edu 10BT), so validation and checkpointing run on a step cadence instead.
+const NUM_EPOCHS: usize = 1;
+// ~65M tokens between evaluations at the default batch size.
+const EVAL_EVERY: usize = 1000;
+// Validation batches scored at each evaluation; a fixed slice so evaluations are comparable.
 const VALID_BATCHES: usize = 30;
-// High ceiling; in practice runs are stopped manually once the checkpointed loss looks good,
-// relying on burn-train's default keep-best-by-validation-loss checkpointing strategy.
-const NUM_EPOCHS: usize = 200;
+const LOG_EVERY: usize = 50;
 const NUM_WORKERS: usize = 32;
 
 #[derive(Parser, Debug)]
@@ -140,20 +148,28 @@ enum Commands {
         /// Device to train on: `cpu`, `cuda` (or `cuda:N`), `mps`, `vulkan`.
         #[arg(long, default_value = "cpu", value_parser = parse_device)]
         device: LibTorchDevice,
-        /// Number of batches (optimizer steps) in one epoch, so an epoch — and therefore a
-        /// checkpoint, since burn-train only checkpoints at epoch boundaries — lands at a
-        /// practical cadence instead of requiring a full sweep of the dataset. Each batch is
-        /// `--batch-size * --context-length` tokens. 0 means a full pass over the train split.
-        #[arg(long, default_value_t = EPOCH_BATCHES)]
-        epoch_size: usize,
-        /// Number of batches in the validation pass, which runs every epoch and so needs the
-        /// same kind of cap as --epoch-size or it dwarfs a capped training epoch. 0 means a
-        /// full pass over the validation split.
+        /// Number of full passes over the train split [default: 1; on --resume, the run's own].
+        #[arg(long)]
+        num_epochs: Option<usize>,
+        /// Validate, save `model`/`best-model` and write a resumable checkpoint every N steps.
+        #[arg(long, default_value_t = EVAL_EVERY)]
+        eval_every: usize,
+        /// Number of batches from the start of the validation split scored at each evaluation.
         #[arg(long, default_value_t = VALID_BATCHES)]
-        valid_size: usize,
-        /// Number of epochs (bounded train-split passes) before training stops on its own.
-        #[arg(long, default_value_t = NUM_EPOCHS)]
-        num_epochs: usize,
+        valid_batches: usize,
+        /// Print the training loss every N steps.
+        #[arg(long, default_value_t = LOG_EVERY)]
+        log_every: usize,
+        /// Stop after this many steps in total (checkpointing first), e.g. for a benchmark.
+        #[arg(long)]
+        max_steps: Option<usize>,
+        /// Continue from `<artifact-dir>/checkpoint`. The model, optimizer and tokenizer settings
+        /// come from `<artifact-dir>/config.json`; the architecture flags are ignored.
+        #[arg(long)]
+        resume: bool,
+        /// Start fresh even though --artifact-dir holds a checkpoint, deleting it.
+        #[arg(long, conflicts_with = "resume")]
+        overwrite: bool,
         /// Number of background dataloader worker threads.
         #[arg(long, default_value_t = NUM_WORKERS)]
         num_workers: usize,
@@ -165,7 +181,8 @@ enum Commands {
         /// `vocab.json` for `simple`).
         #[arg(long)]
         tokenizer_path: Option<String>,
-        /// Where to write `config.json` and checkpoints. Wiped and recreated on every run.
+        /// Where to write `config.json`, `metrics.csv`, models and checkpoints. Wiped and
+        /// recreated on every run, unless `--resume`.
         #[arg(long, default_value = "artifacts")]
         artifact_dir: String,
     },
@@ -196,8 +213,8 @@ enum Commands {
         #[arg(long, default_value = "artifacts/config.json")]
         config_path: String,
         /// Path to the model record to load (no file extension — the recorder appends its
-        /// own), e.g. `artifacts/checkpoint/model-4` to load a specific epoch checkpoint
-        /// instead of a completed run's final saved model.
+        /// own): `artifacts/model` is the latest evaluation, `artifacts/best-model` the one with
+        /// the lowest validation loss.
         #[arg(long, default_value = "artifacts/model")]
         model_path: String,
         /// Device to run inference on: `cpu`, `cuda` (or `cuda:N`), `mps`, `vulkan`.
@@ -261,7 +278,7 @@ fn train_tokenizer(vocab_size: usize, num_docs: usize, min_frequency: u64, outpu
     // Fit the merges on the *train* split only. The tokenizer is part of the model: letting it
     // see validation/test documents leaks those into every downstream eval, because the merge
     // table is then shaped by text the model is later scored on.
-    let (train, valid, _test) = split_dataset(dataset, None, None);
+    let (train, valid, _test) = split_dataset(dataset);
 
     let num_docs = num_docs.min(train.len());
     println!(
@@ -318,71 +335,65 @@ fn load_tokenizer(kind: TokenizerKind, path: Option<String>) -> (AnyTokenizer, S
     (tokenizer, path)
 }
 
-/// Train the GPT model with the given architecture and training parameters.
-fn run_train(
+/// Architecture and loop settings for `train`, as given on the command line.
+struct TrainArgs {
     d_model: usize,
     num_heads: usize,
     num_layers: usize,
     context_length: usize,
     batch_size: usize,
     device: LibTorchDevice,
-    epoch_size: usize,
-    valid_size: usize,
-    num_epochs: usize,
+    num_epochs: Option<usize>,
     num_workers: usize,
     tokenizer_kind: TokenizerKind,
     tokenizer_path: Option<String>,
-    artifact_dir: &str,
-) {
+    artifact_dir: String,
+    options: RunOptions,
+}
+
+/// Train the GPT model with the given architecture and training parameters.
+fn run_train(args: TrainArgs) {
     type MyBackend = LibTorch<f32>;
     type MyAutodiffBackend = Autodiff<MyBackend>;
 
-    // Load the tokenizer up front purely to size the embedding and output head. The training
-    // run reloads it from the config, so there is exactly one place that decides which
-    // tokenizer a checkpoint belongs to.
-    let (tokenizer, tokenizer_path) = load_tokenizer(tokenizer_kind, tokenizer_path);
-    let vocab_size = tokenizer.get_vocab_size();
-    drop(tokenizer);
-
-    let gpt_config = gpt_model_config(vocab_size, context_length, d_model, num_heads, num_layers);
-
-    // `--epoch-size` and `--valid-size` are counts of *batches*, because a batch is one
-    // optimizer step and that is the unit the checkpoint cadence is actually measured in.
-    // `split_dataset` caps by document, though, so convert: the dataloader hands the batcher
-    // `documents_per_batch` documents per batch, and that pool size already accounts for
-    // `--batch-size` and `--context-length`. Note the consequence of counting steps rather than
-    // documents — halving `--batch-size` now halves the tokens an epoch sees, where capping by
-    // document held tokens-per-epoch roughly fixed and doubled the step count instead.
-    let docs_per_batch = documents_per_batch(batch_size, context_length);
-    let batches_to_items = |batches: usize| {
-        if batches == 0 {
-            None
-        } else {
-            Some(batches * docs_per_batch)
+    let config = if args.options.resume {
+        // A resumed run *is* the original run: same model, optimizer, tokenizer and batch shape.
+        let path = format!("{}/config.json", args.artifact_dir);
+        let config = TrainingConfig::load(&path)
+            .unwrap_or_else(|err| panic!("--resume: cannot load {path}: {err}"));
+        println!("Resuming with the settings in {path}; architecture flags are ignored");
+        match args.num_epochs {
+            Some(num_epochs) => config.with_num_epochs(num_epochs),
+            None => config,
         }
-    };
-    let max_train_items = batches_to_items(epoch_size);
-    let max_valid_items = batches_to_items(valid_size);
+    } else {
+        // Load the tokenizer up front purely to size the embedding and output head. The training
+        // run reloads it from the config, so there is exactly one place that decides which
+        // tokenizer a checkpoint belongs to.
+        let (tokenizer, tokenizer_path) = load_tokenizer(args.tokenizer_kind, args.tokenizer_path);
+        let vocab_size = tokenizer.get_vocab_size();
+        drop(tokenizer);
 
-    if let (Some(train_items), Some(valid_items)) = (max_train_items, max_valid_items) {
-        println!(
-            "Epoch: {epoch_size} batches ({train_items} documents, {} tokens), \
-             validation: {valid_size} batches ({valid_items} documents)",
-            epoch_size * batch_size * context_length
+        let gpt_config = gpt_model_config(
+            vocab_size,
+            args.context_length,
+            args.d_model,
+            args.num_heads,
+            args.num_layers,
         );
-    }
+        TrainingConfig::new(gpt_config, AdamWConfig::new())
+            .with_batch_size(args.batch_size)
+            .with_num_epochs(args.num_epochs.unwrap_or(NUM_EPOCHS))
+            .with_num_workers(args.num_workers)
+            .with_tokenizer_kind(Some(args.tokenizer_kind))
+            .with_tokenizer_path(Some(tokenizer_path))
+    };
 
     crate::training::train_from_disk::<MyAutodiffBackend>(
-        artifact_dir,
-        TrainingConfig::new(gpt_config, AdamWConfig::new())
-            .with_batch_size(batch_size)
-            .with_num_epochs(num_epochs)
-            .with_num_workers(num_workers)
-            .with_tokenizer_kind(Some(tokenizer_kind))
-            .with_tokenizer_path(Some(tokenizer_path)),
-        device.clone(),
-        max_train_items,
-        max_valid_items,
+        &args.artifact_dir,
+        config,
+        args.options,
+        args.device,
     );
 }
 
@@ -399,7 +410,7 @@ fn run_inspect_batch(
     let batcher = TextBatcher::new(tokenizer.clone(), context_size, batch_size);
 
     let dataset = load_default_fineweb_dataset();
-    let (train_ds, _valid_ds, _test_ds) = split_dataset(dataset, None, None);
+    let (train_ds, _valid_ds, _test_ds) = split_dataset(dataset);
 
     // Documents per call, not sequences per batch — see `documents_per_batch`.
     let docs_per_batch = documents_per_batch(batch_size, context_size);
@@ -424,8 +435,7 @@ fn run_inspect_batch(
     let targets_data = batch.targets.into_data().to_vec::<i64>().unwrap();
 
     println!(
-        "Inspected batch: actual_batch_size={}, seq_len={} (capped by context_size={})",
-        actual_batch_size, seq_len, context_size
+        "Inspected batch: actual_batch_size={actual_batch_size}, seq_len={seq_len}"
     );
     println!();
 
@@ -637,28 +647,38 @@ fn main() {
             context_length,
             batch_size,
             device,
-            epoch_size,
-            valid_size,
             num_epochs,
+            eval_every,
+            valid_batches,
+            log_every,
+            max_steps,
+            resume,
+            overwrite,
             num_workers,
             tokenizer,
             tokenizer_path,
             artifact_dir,
-        } => run_train(
+        } => run_train(TrainArgs {
             d_model,
             num_heads,
             num_layers,
             context_length,
             batch_size,
             device,
-            epoch_size,
-            valid_size,
             num_epochs,
             num_workers,
-            tokenizer,
+            tokenizer_kind: tokenizer,
             tokenizer_path,
-            &artifact_dir,
-        ),
+            artifact_dir,
+            options: RunOptions {
+                eval_every,
+                valid_batches,
+                log_every,
+                max_steps,
+                resume,
+                overwrite,
+            },
+        }),
         Commands::InspectBatch {
             batch_size,
             context_size,
