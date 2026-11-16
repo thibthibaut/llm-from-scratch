@@ -22,21 +22,22 @@ pub fn _load_gutenberg_dataset() -> SqliteDataset<TextItem> {
         .expect("Failed to load the dataset")
 }
 
-/// Path to the cached fineweb-edu sqlite file that `burn-dataset` downloaded
-/// under `~/.cache/burn-dataset`.
+/// Environment variable overriding where the fineweb-edu sqlite file lives.
+pub const FINEWEB_DB_ENV: &str = "FINEWEB_DB";
+
+/// Path to the fineweb-edu sqlite file: `$FINEWEB_DB` if set, else the RunPod network-volume
+/// location. Build the file with `scripts/build_fineweb_db.py`.
 pub fn default_fineweb_dataset_path() -> PathBuf {
-    // let home = std::env::var("HOME").expect("HOME environment variable must be set");
-    PathBuf::from("/")
-        .join("workspace")
-        .join("HuggingFaceFWfineweb-edu-sample-10BT.db")
+    std::env::var_os(FINEWEB_DB_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/workspace/HuggingFaceFWfineweb-edu-sample-10BT.db"))
 }
 
 pub fn load_fineweb_dataset_from_disk(path: &str) -> SqliteDataset<TextItem> {
     SqliteDataset::from_db_file(path, "train").expect("Failed to load SQLite dataset")
 }
 
-/// Load the fineweb-edu dataset directly from its cached `.db` file in
-/// `~/.cache/burn-dataset`, skipping `HuggingfaceDatasetLoader`'s network/cache check.
+/// Load the fineweb-edu dataset from the `.db` file at `default_fineweb_dataset_path()`.
 pub fn load_default_fineweb_dataset() -> SqliteDataset<TextItem> {
     let path = default_fineweb_dataset_path();
     let path = path.to_str().expect("dataset path should be valid UTF-8");
