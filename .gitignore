@@ -5,3 +5,4 @@ perf.data
 .env
 .envrc
 .direnv/
+clearml-creds
