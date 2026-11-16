@@ -14,41 +14,45 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::dataset::{
-    PackedBatch, TextBatcher, TextItem, documents_per_batch, load_default_fineweb_dataset,
+    PackedBatch, TextBatch, TextBatcher, TextItem, documents_per_batch, load_default_fineweb_dataset,
     split_dataset,
 };
 use crate::loader::OrderedLoader;
-use crate::model::{GPTModel, GPTModelConfig};
+use crate::model::{GPTModel, GPTModelConfig, Precision};
+use crate::ops::{FusedAutodiffBackend, FusedOps, cross_entropy};
 use crate::tokenizer::{AnyTokenizer, Tokenizer, TokenizerKind};
 use burn::data::dataset::Dataset;
 use burn::data::dataset::transform::ShuffledDataset;
 use burn::module::AutodiffModule;
-use burn::nn::loss::CrossEntropyLossConfig;
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::record::{CompactRecorder, FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
 use burn::tensor::ElementConversion;
-use burn::tensor::backend::AutodiffBackend;
 use serde::{Deserialize, Serialize};
 
 /// Seed for packing the validation batches, so every evaluation scores the exact same tokens.
 const VALID_SEED: u64 = 0x5EED_0F_7A11D;
 
-impl<B: Backend> GPTModel<B> {
+impl<B: FusedOps> GPTModel<B> {
     /// Mean next-token cross-entropy over a batch.
     ///
     /// Only the loss: the old burn-train step also returned the full `[batch, seq, vocab]`
     /// logits plus an argmax over them for its metrics, keeping a multi-GB tensor alive per
-    /// step for nothing the loop reads.
-    pub fn loss(&self, inputs: Tensor<B, 2, Int>, targets: Tensor<B, 2, Int>) -> Tensor<B, 1> {
+    /// step for nothing the loop reads. The loss itself is the fused `ops::cross_entropy`,
+    /// which doesn't keep a log-softmax copy of the logits for the backward pass.
+    pub fn loss(
+        &self,
+        inputs: Tensor<B, 2, Int>,
+        targets: Tensor<B, 2, Int>,
+        precision: Precision,
+    ) -> Tensor<B, 1> {
         let [batch_size, seq_len] = inputs.dims();
-        let logits = self.forward(inputs);
+        let logits = self.forward_with(inputs, precision);
         let [_, _, vocab_size] = logits.dims();
-        let logits = logits.reshape([batch_size * seq_len, vocab_size]);
-        let targets = targets.reshape([batch_size * seq_len]);
-        CrossEntropyLossConfig::new()
-            .init(&logits.device())
-            .forward(logits, targets)
+        cross_entropy(
+            logits.reshape([batch_size * seq_len, vocab_size]),
+            targets.reshape([batch_size * seq_len]),
+        )
     }
 }
 
@@ -109,6 +113,12 @@ pub struct RunOptions {
     /// Allow a fresh run to wipe an artifact dir that holds a checkpoint. Without it, a
     /// forgotten `--resume` would silently delete a run's checkpoint.
     pub overwrite: bool,
+    /// Numeric precision of the matmuls; see `Precision`.
+    pub precision: Precision,
+    /// Sequences per forward/backward pass. Each optimizer step still sees `batch_size`
+    /// sequences: gradients of `batch_size / micro_batch_size` micro-batches are summed before
+    /// the update, so this changes memory use, not the training math. `None` = `batch_size`.
+    pub micro_batch_size: Option<usize>,
 }
 
 impl Default for RunOptions {
@@ -120,6 +130,8 @@ impl Default for RunOptions {
             max_steps: None,
             resume: false,
             overwrite: false,
+            precision: Precision::F32,
+            micro_batch_size: None,
         }
     }
 }
@@ -190,7 +202,7 @@ fn save_model_atomically<B: Backend>(model: &GPTModel<B>, artifact_dir: &str, na
 /// moved aside to `checkpoint.old/`, the new one renamed into place, and the old one deleted.
 /// At every instant one of the three directories holds a complete checkpoint, and
 /// `find_checkpoint` knows where to look.
-fn save_checkpoint<B: AutodiffBackend, O: Optimizer<GPTModel<B>, B>>(
+fn save_checkpoint<B: FusedAutodiffBackend, O: Optimizer<GPTModel<B>, B>>(
     artifact_dir: &str,
     model: &GPTModel<B>,
     optim: &O,
@@ -222,7 +234,7 @@ fn save_checkpoint<B: AutodiffBackend, O: Optimizer<GPTModel<B>, B>>(
     let _ = fs::remove_dir_all(&old);
 }
 
-fn load_checkpoint<B: AutodiffBackend, O: Optimizer<GPTModel<B>, B>>(
+fn load_checkpoint<B: FusedAutodiffBackend, O: Optimizer<GPTModel<B>, B>>(
     artifact_dir: &str,
     model: GPTModel<B>,
     optim: O,
@@ -298,25 +310,43 @@ fn reset_artifact_dir(artifact_dir: &str) {
         .unwrap_or_else(|err| panic!("Failed to create artifact dir '{artifact_dir}': {err}"));
 }
 
+/// Split a batch into consecutive `(inputs, targets)` micro-batches of `size` sequences.
+fn micro_batches<B: Backend>(
+    batch: TextBatch<B>,
+    size: usize,
+) -> impl Iterator<Item = (Tensor<B, 2, Int>, Tensor<B, 2, Int>)> {
+    let [batch_size, _] = batch.inputs.dims();
+    (0..batch_size).step_by(size).map(move |start| {
+        (
+            batch.inputs.clone().narrow(0, start, size),
+            batch.targets.clone().narrow(0, start, size),
+        )
+    })
+}
+
 /// Mean loss over the (pre-packed) validation batches.
-fn validate<B: Backend, T: Tokenizer>(
+fn validate<B: FusedOps, T: Tokenizer>(
     model: &GPTModel<B>,
     batcher: &TextBatcher<T>,
     batches: &[PackedBatch],
+    micro_batch_size: usize,
+    precision: Precision,
     device: &B::Device,
 ) -> f64 {
     let mut total: Option<Tensor<B, 1>> = None;
+    let mut count = 0usize;
     for packed in batches {
         let batch = batcher.upload::<B>(packed.clone(), device);
-        let loss = model.loss(batch.inputs, batch.targets);
-        total = Some(match total {
-            Some(t) => t + loss,
-            None => loss,
-        });
+        for (inputs, targets) in micro_batches(batch, micro_batch_size) {
+            let loss = model.loss(inputs, targets, precision);
+            count += 1;
+            total = Some(match total {
+                Some(t) => t + loss,
+                None => loss,
+            });
+        }
     }
-    total.map_or(f64::NAN, |t| {
-        t.into_scalar().elem::<f64>() / batches.len() as f64
-    })
+    total.map_or(f64::NAN, |t| t.into_scalar().elem::<f64>() / count as f64)
 }
 
 fn format_duration(secs: f64) -> String {
@@ -332,7 +362,7 @@ fn format_duration(secs: f64) -> String {
 /// the first `valid_batches` batches of the validation split are scored, `model` (latest) and
 /// `best-model` (lowest validation loss) are written for `generate-text`, and a full-precision
 /// checkpoint is written to `checkpoint/` for `--resume`.
-pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
+pub fn train<B: FusedAutodiffBackend, T, D: Dataset<TextItem> + 'static>(
     artifact_dir: &str,
     config: TrainingConfig,
     options: RunOptions,
@@ -387,6 +417,14 @@ pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
     let valid_batches = options.valid_batches.min(available_valid_batches);
     let total_steps = (steps_per_epoch * config.num_epochs)
         .min(options.max_steps.unwrap_or(usize::MAX));
+    let micro_batch_size = options.micro_batch_size.unwrap_or(config.batch_size);
+    assert!(
+        micro_batch_size > 0 && config.batch_size.is_multiple_of(micro_batch_size),
+        "--micro-batch-size ({micro_batch_size}) must divide --batch-size ({})",
+        config.batch_size
+    );
+    let micro_steps = config.batch_size / micro_batch_size;
+    let precision = options.precision;
     let num_workers = config.num_workers.max(1);
     let prefetch = 4 * num_workers;
 
@@ -395,6 +433,10 @@ pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
          {docs_per_batch} documents), {steps_per_epoch} steps per epoch, {} epochs, \
          {total_steps} steps total. Validating on {valid_batches} batches every {} steps.",
         config.batch_size, config.num_epochs, options.eval_every
+    );
+    println!(
+        "Precision: {precision:?}; {micro_steps} micro-batch(es) of {micro_batch_size} \
+         sequences per step"
     );
 
     // Validation batches never change, so pack them once.
@@ -455,7 +497,14 @@ pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
 
     // Runs validation and writes everything a later `generate-text` or `--resume` needs.
     let evaluate = |model: &GPTModel<B>, optim: &_, state: &mut TrainState| {
-        let valid_loss = validate(&model.valid(), &batcher, &valid_packed, &device);
+        let valid_loss = validate(
+            &model.valid(),
+            &batcher,
+            &valid_packed,
+            micro_batch_size,
+            precision,
+            &device,
+        );
         let epoch_frac = state.epoch as f64 + state.batch_in_epoch as f64 / steps_per_epoch as f64;
         let improved = state.best_valid_loss.is_none_or(|best| valid_loss < best);
         println!(
@@ -504,19 +553,26 @@ pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
 
         for (index, packed) in loader {
             let batch = batcher.upload::<B>(packed, &device);
-            let loss = model.loss(batch.inputs, batch.targets);
 
-            // Accumulate on the device: reading the loss back every step would make the CPU wait
-            // for the GPU to drain each step before it could queue the next one.
-            let detached = loss.clone().detach().inner();
-            interval_loss = Some(match interval_loss {
-                Some(sum) => sum + detached,
-                None => detached,
-            });
+            // Gradient accumulation over micro-batches. Each micro-batch's mean loss is scaled
+            // by 1 / micro_steps, so the summed gradients are those of the whole batch's mean.
+            let mut accumulator = GradientsAccumulator::new();
+            for (inputs, targets) in micro_batches(batch, micro_batch_size) {
+                let loss = model.loss(inputs, targets, precision) / micro_steps as f64;
+
+                // Accumulate on the device: reading the loss back every step would make the CPU
+                // wait for the GPU to drain each step before it could queue the next one.
+                let detached = loss.clone().detach().inner();
+                interval_loss = Some(match interval_loss {
+                    Some(sum) => sum + detached,
+                    None => detached,
+                });
+
+                accumulator.accumulate(&model, GradientsParams::from_grads(loss.backward(), &model));
+            }
             interval_steps += 1;
 
-            let grads = GradientsParams::from_grads(loss.backward(), &model);
-            model = optim.step(config.learning_rate, model, grads);
+            model = optim.step(config.learning_rate, model, accumulator.grads());
 
             state.global_step += 1;
             state.batch_in_epoch = index + 1;
@@ -579,7 +635,7 @@ pub fn train<B: AutodiffBackend, T, D: Dataset<TextItem> + 'static>(
 }
 
 /// Load the tokenizer and the full fineweb dataset from disk, then run `train`.
-pub fn train_from_disk<B: AutodiffBackend>(
+pub fn train_from_disk<B: FusedAutodiffBackend>(
     artifact_dir: &str,
     config: TrainingConfig,
     options: RunOptions,
@@ -794,6 +850,31 @@ mod tests {
         assert_eq!(state(artifact_dir).global_step, 4);
 
         std::fs::remove_dir_all(artifact_dir).ok();
+    }
+
+    /// bf16 mixed precision and micro-batching run end to end (on CPU here) and land close to
+    /// the f32 result: same seed, same batches, only the matmul precision differs.
+    #[test]
+    fn test_bf16_micro_batched_training_tracks_f32() {
+        let f32_dir = std::env::temp_dir().join("llm-from-scratch-test-precision-f32");
+        let bf16_dir = std::env::temp_dir().join("llm-from-scratch-test-precision-bf16");
+        let (f32_dir, bf16_dir) = (f32_dir.to_str().unwrap(), bf16_dir.to_str().unwrap());
+        let options = RunOptions { eval_every: 100, overwrite: true, ..RunOptions::default() };
+
+        run(f32_dir, tiny_config(), options.clone());
+        run(
+            bf16_dir,
+            tiny_config(),
+            RunOptions { precision: Precision::Bf16, micro_batch_size: Some(1), ..options },
+        );
+
+        let (a, b) = (checkpoint_logits(f32_dir), checkpoint_logits(bf16_dir));
+        let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        assert!(max_diff < 0.05, "bf16 drifted from f32 by {max_diff}");
+        assert!(max_diff > 0.0, "bf16 run should not be bit-identical to f32");
+
+        std::fs::remove_dir_all(f32_dir).ok();
+        std::fs::remove_dir_all(bf16_dir).ok();
     }
 
     /// Forgetting `--resume` must not wipe a run's checkpoint.

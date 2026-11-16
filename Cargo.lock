@@ -3856,6 +3856,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "tch",
  "tokenizers",
 ]
 

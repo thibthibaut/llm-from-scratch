@@ -66,7 +66,7 @@ cargo run --release -- inspect-batch --batch-size 2 --context-size 64 --tokenize
 ## Training
 
 ```bash
-cargo run --release -- train --device cuda --batch-size 4   # largest batch that fits 24 GB
+cargo run --release -- train --device cuda --precision bf16 --batch-size 64 --micro-batch-size 8
 ```
 
 Each epoch is a full pass over the train split (80% of the corpus) in a fresh shuffled order;
@@ -89,6 +89,87 @@ early (after a checkpoint), which is handy for benchmarks.
 
 Checkpoints are written to `checkpoint.tmp/`, flushed, and only then swapped into place, so a
 crash at any point leaves a complete checkpoint that `--resume` finds.
+
+### Precision and memory
+
+`--precision` picks what the matrix multiplications run in; weights, AdamW state, layer norms,
+the residual stream and the loss stay f32 in every mode:
+
+- `f32` (default) — exact; the reference.
+- `tf32` — f32 tensors, TF32 tensor-core matmuls (what PyTorch's `allow_tf32` enables).
+- `bf16` — autocast-style mixed precision: matmul and attention inputs cast to bf16 with f32
+  accumulation, f32 master weights. This is the standard way GPT-2/3, Llama and nanoGPT are
+  trained. It is *not* the same as running the whole model in bf16 (`LibTorch<bf16>`), which
+  does hurt training: bf16's 8-bit mantissa rounds small weight updates away.
+
+### Micro-batches (gradient accumulation)
+
+`--batch-size` is the *optimizer* batch: how many sequences each AdamW step averages over. It's
+a training hyperparameter. `--micro-batch-size` is how many sequences go through the GPU at
+once. It's purely a memory/speed knob, and must divide `--batch-size`.
+
+Each step, the loop (`training::train`) splits the batch into
+`k = batch_size / micro_batch_size` micro-batches and, for each one:
+
+1. runs forward and computes that micro-batch's mean loss;
+2. divides it by `k` and calls `backward()`;
+3. adds the resulting gradients into a `GradientsAccumulator`.
+
+Then it takes **one** optimizer step with the summed gradients. The mean of a batch is the mean
+of its equal-sized micro-batch means, and gradients are linear, so the accumulated gradient is
+exactly the full-batch gradient. The optimizer sees the same update it would with the whole
+batch at once, up to float rounding. (Measured: micro-batches of 16 and 8 give the same loss,
+7.9887 at step 30 of an f32 run.) What it saves is memory:
+only one micro-batch's activations are alive at a time, so peak memory scales with
+`--micro-batch-size`, not `--batch-size`. The cost is `k` smaller forward/backward passes per
+step instead of one big one. Validation is split into micro-batches the same way.
+
+### Recommended settings: RTX 4090 (24 GB)
+
+```bash
+train --device cuda --precision bf16 --batch-size 64 --micro-batch-size 8
+```
+
+Measured on an idle RTX 4090, GPT-2-small (12 layers, d=768, 32k vocab), 1024-token context,
+64 sequences (65,536 tokens) per optimizer step:
+
+| `--precision` | `--micro-batch-size` | tokens/s  | peak GPU memory | one epoch of 10BT |
+|---------------|----------------------|-----------|-----------------|-------------------|
+| `bf16`        | 4                    | 83.6k     | 5.5 GB          | ~20.5 h           |
+| **`bf16`**    | **8**                | **88.5k** | **7.6 GB**      | **~19.4 h**       |
+| `bf16`        | 16                   | 80.3k     | 11.7 GB         | ~21.4 h           |
+| `bf16`        | 32                   | 70.3k     | 20.7 GB         | ~24.4 h           |
+| `bf16`        | 64                   | —         | out of memory   |                   |
+| `tf32`        | 8                    | 50.6k     | 11.3 GB         | ~34 h             |
+| `f32`         | 8                    | 38.0k     | 11.3 GB         | ~45 h             |
+| `f32`         | 16                   | 37.0k     | 17.7 GB         | ~46 h             |
+
+**Bigger micro-batches are slower here, even with memory to spare.** Filling the GPU's memory
+is not the goal. An Nsight Systems profile (`nsys`, micro-batch 8 vs 32, same tokens) shows the
+matrix multiplies and attention take the same total time in both. The whole difference is in
+elementwise kernels on activations (residual adds, casts, bias adds, GELU, the loss):
+**5.0 s vs 7.5 s**. These are memory-bound, and the 4090 has a 72 MB L2 cache, which explains
+it (consistent with the profile, though not measured directly with cache counters). One
+`[tokens, 768]` f32 activation is 25 MB at micro-batch 8, so it stays in L2 between
+consecutive kernels; at micro-batch 32 it's 100 MB and every kernel goes to DRAM. Very small
+micro-batches lose again (micro-batch 4), probably because the matmuls get too small to fill
+the GPU (not profiled).
+
+Other things tried:
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` made no difference (80.4k vs 80.3k at
+  micro-batch 16), so this isn't allocator fragmentation.
+- `--batch-size 128 --micro-batch-size 8` reaches 89.4k tokens/s, only 1% more. It also
+  changes the training dynamics (twice the tokens per step), so it isn't worth it for speed.
+
+Even at micro-batch 8, elementwise kernels are more than half of GPU time. Fusing them, the way
+`torch.compile` would, is the next performance lever, not a bigger batch.
+
+For reference, `main` before these changes fit at most batch 4 in 24 GB and ran at ~3.9k
+tokens/s, with the GPU idle more than half the time.
+
+The three modes train the same model: 300 steps from the same seed, data and initial weights
+reach validation losses of 7.3583 / 7.3582 / 7.3582 at step 100 and 6.8632 / 6.8632 / 6.8633 at
+step 300 (`f32` / `tf32` / `bf16`).
 
 ## GPU training setup (RunPod, or any bare CUDA box)
 
