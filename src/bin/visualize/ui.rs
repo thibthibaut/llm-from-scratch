@@ -1,0 +1,427 @@
+use crate::app::{App, Stage};
+use crate::pca::Pca;
+use llm_from_scratch::sampling::Sampler;
+use llm_from_scratch::tokenizer::{Token, Tokenizer};
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Paragraph};
+
+/// Tokens shown in the embedding and attention panels (the last ones of the input).
+pub const WINDOW: usize = 8;
+const TOP: usize = 10;
+const LABEL: usize = 8;
+
+pub fn display_piece(piece: &str) -> String {
+    piece.replace('Ġ', "␣").replace('Ċ', "↵")
+}
+
+/// 0 → mid-grey, ±`row_max_abs` → white / near-black.
+pub fn embedding_grey(v: f32, row_max_abs: f32) -> u8 {
+    if row_max_abs == 0.0 {
+        return 128;
+    }
+    (128.0 + 127.0 * v / row_max_abs).round().clamp(0.0, 255.0) as u8
+}
+
+pub fn attention_grey(w: f32) -> u8 {
+    (255.0 * w).round().clamp(0.0, 255.0) as u8
+}
+
+fn grey(g: u8) -> Style {
+    Style::default().bg(Color::Rgb(g, g, g))
+}
+
+fn piece<T: Tokenizer>(app: &App<T>, t: Token) -> String {
+    display_piece(&app.tokenizer.token_to_piece(t).unwrap_or_default())
+}
+
+/// `s` cut or padded to exactly `w` chars.
+fn fit(s: &str, w: usize) -> String {
+    format!("{:w$}", s.chars().take(w).collect::<String>())
+}
+
+pub fn draw<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca) {
+    let [title, prompt, tokens, middle, next, sampler, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(4),
+        Constraint::Length(WINDOW as u16 + 3),
+        Constraint::Fill(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    let [emb, att] = Layout::horizontal([Constraint::Fill(1); 2]).areas(middle);
+    title_bar(frame, app, title);
+    prompt_panel(frame, app, prompt);
+    tokens_panel(frame, app, tokens);
+    embeddings_panel(frame, app, pca, emb);
+    attention_panel(frame, app, att);
+    next_token_panel(frame, app, next);
+    sampler_panel(frame, app, sampler);
+    footer_bar(frame, app, footer);
+}
+
+/// Renders a titled block and returns its inner area.
+fn panel(frame: &mut Frame, area: Rect, title: String, style: Style) -> Rect {
+    let block = Block::bordered().title(title).border_style(style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
+}
+
+fn title_bar<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
+    let (badge, color) = if app.is_editing() {
+        (" EDIT ", Color::Yellow)
+    } else {
+        (" INFERENCE ", Color::Cyan)
+    };
+    let line = Line::from(vec![
+        Span::styled(badge, Style::default().fg(Color::Black).bg(color)),
+        Span::raw(" GPT-2 forward pass"),
+    ]);
+    frame.render_widget(line, area);
+}
+
+fn prompt_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
+    let editing = app.is_editing();
+    let style = if editing {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let inner = panel(frame, area, " Prompt ".into(), style);
+    let text = if editing {
+        format!("{}▌", app.text)
+    } else {
+        app.text.clone()
+    };
+    // Show the end of the text: newlines as ↵, then the last line-width chars.
+    let chars: Vec<char> = text.replace('\n', "↵").chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(inner.width as usize)..]
+        .iter()
+        .collect();
+    frame.render_widget(Paragraph::new(tail), inner);
+}
+
+fn tokens_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
+    let inner = panel(frame, area, " Tokens ".into(), Style::default());
+    // Pack chips into lines by hand, then keep the last ones so new tokens stay visible.
+    let width = inner.width as usize;
+    let mut lines: Vec<Vec<Span>> = vec![vec![]];
+    let mut used = 0;
+    for &t in &app.tokens {
+        let chip = format!("[{} {}] ", piece(app, t), t.0);
+        let len = chip.chars().count();
+        if used > 0 && used + len > width {
+            lines.push(vec![]);
+            used = 0;
+        }
+        used += len;
+        lines.last_mut().unwrap().push(Span::raw(chip));
+    }
+    let skip = lines.len().saturating_sub(inner.height as usize);
+    let lines: Vec<Line> = lines.into_iter().skip(skip).map(Line::from).collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The last `rows` tokens of the model input, aligned with trace rows.
+fn window_labels<T: Tokenizer>(app: &App<T>, rows: usize) -> Vec<String> {
+    let input = app.model_input();
+    let offset = input.len().saturating_sub(rows);
+    (rows.saturating_sub(WINDOW)..rows)
+        .map(|i| {
+            input
+                .get(offset + i)
+                .map_or(String::new(), |&t| piece(app, t))
+        })
+        .collect()
+}
+
+fn embeddings_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca, area: Rect) {
+    let inner = panel(
+        frame,
+        area,
+        format!(" Embeddings  layer {} ", app.layer),
+        Style::default(),
+    );
+    let Some(trace) = &app.trace else { return };
+    let rows = match app.layer {
+        0 => &trace.embedding,
+        n => match trace.blocks.get(n - 1) {
+            Some(b) => &b.residual,
+            None => return,
+        },
+    };
+    let start = rows.len().saturating_sub(WINDOW);
+    let labels = window_labels(app, rows.len());
+    let lines: Vec<Line> = rows[start..]
+        .iter()
+        .zip(labels)
+        .map(|(row, label)| {
+            let proj = pca.project(row);
+            let max = proj.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let cell = (inner.width as usize)
+                .saturating_sub(LABEL)
+                .checked_div(proj.len())
+                .unwrap_or(1)
+                .clamp(1, 2);
+            let mut spans = vec![Span::raw(fit(&label, LABEL))];
+            spans.extend(
+                proj.iter()
+                    .map(|&v| Span::styled(" ".repeat(cell), grey(embedding_grey(v, max)))),
+            );
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn attention_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
+    let inner = panel(
+        frame,
+        area,
+        format!(" Attention  layer {} · head {} ", app.layer, app.head + 1),
+        Style::default(),
+    );
+    let Some(trace) = &app.trace else { return };
+    let Some(weights) = app
+        .layer
+        .checked_sub(1)
+        .and_then(|l| trace.blocks.get(l))
+        .and_then(|b| b.attention.get(app.head))
+    else {
+        return;
+    };
+    let start = weights.len().saturating_sub(WINDOW);
+    let labels = window_labels(app, weights.len());
+    let mut header = vec![Span::raw(" ".repeat(LABEL))];
+    header.extend(labels.iter().map(|l| Span::raw(fit(l, 3) + " ")));
+    let mut lines = vec![Line::from(header)];
+    for (row, label) in weights[start..].iter().zip(&labels) {
+        let mut spans = vec![Span::raw(fit(label, LABEL))];
+        for &w in &row[start..] {
+            spans.push(Span::styled("   ", grey(attention_grey(w))));
+            spans.push(Span::raw(" "));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// `█` bar of `p · width` cells followed by the value.
+fn bar(p: f32, width: usize, style: Style) -> Vec<Span<'static>> {
+    let n = (p * width as f32).round() as usize;
+    vec![
+        Span::styled("█".repeat(n), style),
+        Span::raw(format!("{} {p:.2}", " ".repeat(width - n.min(width)))),
+    ]
+}
+
+/// The last logits once the stage reaches `from`.
+fn logits_from<T: Tokenizer>(app: &App<T>, from: Stage) -> Option<&[f32]> {
+    let order = |s| match s {
+        Stage::Output => 1,
+        Stage::Sampler => 2,
+        Stage::Drawn => 3,
+        _ => 0,
+    };
+    (order(app.stage) >= order(from)).then_some(app.trace.as_ref()?.last_logits.as_slice())
+}
+
+fn next_token_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
+    let inner = panel(frame, area, " Next token ".into(), Style::default());
+    let Some(logits) = logits_from(app, Stage::Output) else {
+        return;
+    };
+    let width = (inner.width as usize).saturating_sub(LABEL + 6);
+    let lines: Vec<Line> = Sampler::default()
+        .distribution(logits)
+        .into_iter()
+        .take(TOP)
+        .map(|(id, p)| {
+            let mut spans = vec![Span::raw(fit(&piece(app, Token(id as u32)), LABEL))];
+            spans.extend(bar(p, width, Style::default().fg(Color::Cyan)));
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn sampler_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
+    let off = |o: Option<String>| o.unwrap_or_else(|| "off".into());
+    let title = format!(
+        " Sampler  T={:.1}  top-k {}  top-p {} ",
+        app.temperature,
+        off(app.top_k.map(|k| k.to_string())),
+        off(app.top_p.map(|p| format!("{p:.2}"))),
+    );
+    let inner = panel(frame, area, title, Style::default());
+    let Some(logits) = logits_from(app, Stage::Sampler) else {
+        return;
+    };
+    let model = Sampler::default().distribution(logits);
+    let filtered = app.sampler().distribution(logits);
+    let drawn = if app.stage == Stage::Drawn {
+        app.drawn
+    } else {
+        None
+    };
+    let mut rows: Vec<(usize, f32)> = model.iter().take(TOP).copied().collect();
+    if let Some(d) = drawn.filter(|d| !rows.iter().any(|r| r.0 == *d)) {
+        rows.extend(model.iter().find(|r| r.0 == d));
+    }
+    // label, then two columns of (bar + " 0.00"), then the marker
+    let width = ((inner.width as usize).saturating_sub(LABEL + 2 * 6 + 10) / 2).max(1);
+    let mut lines = vec![Line::raw(format!(
+        "{}{}{}",
+        " ".repeat(LABEL),
+        fit("model (T=1)", width + 6),
+        "after T, k, p"
+    ))];
+    for (id, p) in rows {
+        let mut spans = vec![Span::raw(fit(&piece(app, Token(id as u32)), LABEL))];
+        spans.extend(bar(p, width, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::raw(" "));
+        match filtered.iter().find(|r| r.0 == id) {
+            Some(&(_, q)) => spans.extend(bar(q, width, Style::default().fg(Color::Green))),
+            None => spans.push(Span::styled(
+                fit("✗ cut", width + 5),
+                Style::default().fg(Color::Red),
+            )),
+        }
+        if drawn == Some(id) {
+            spans.push(Span::styled(
+                "  ◀ drawn",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn footer_bar<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
+    let text = if app.is_editing() {
+        "type to edit · Enter run · Ctrl+C quit".to_string()
+    } else {
+        let stage = match app.stage {
+            Stage::Block(n) => {
+                format!(
+                    "block {n}/{}",
+                    app.trace.as_ref().map_or(0, |t| t.blocks.len())
+                )
+            }
+            Stage::Output => "output".into(),
+            Stage::Sampler => "sampler".into(),
+            Stage::Drawn => "drawn".into(),
+            Stage::Embedding | Stage::Editing => "embedding".into(),
+        };
+        format!(
+            "{stage} · Enter next · Space sampler · ↑↓ layer · ←→ head · t/T temp · k/K top-k · p/P top-p · Esc edit · Ctrl+C quit"
+        )
+    };
+    frame.render_widget(
+        Line::styled(text, Style::default().fg(Color::DarkGray)),
+        area,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_support::{CharTokenizer, fake_trace};
+    use crate::app::{App, Stage};
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn pca() -> Pca {
+        let data: Vec<f32> = (0..32).map(|i| ((i * 7) % 11) as f32).collect();
+        Pca::fit(&data, 8, 4, 4)
+    }
+    fn press(a: &mut App<CharTokenizer>, code: KeyCode) {
+        a.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    /// Typed `text`, ran, and got `fake_trace(text.len())`.
+    fn running(text: &str) -> App<CharTokenizer> {
+        let mut a = App::new(CharTokenizer, 2, 2, StdRng::seed_from_u64(0));
+        for c in text.chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Enter);
+        a.set_trace(fake_trace(text.chars().count()));
+        a
+    }
+    fn render(a: &App<CharTokenizer>, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, a, &pca())).unwrap();
+        t.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn display_piece_maps_bpe_markers() {
+        assert_eq!(display_piece("Ġcat"), "␣cat");
+        assert_eq!(display_piece("Ċ"), "↵");
+    }
+
+    #[test]
+    fn greys() {
+        assert_eq!(embedding_grey(0.0, 2.0), 128);
+        assert_eq!(embedding_grey(2.0, 2.0), 255);
+        assert_eq!(embedding_grey(-2.0, 2.0), 1);
+        assert_eq!(embedding_grey(1.0, 0.0), 128);
+        assert_eq!(attention_grey(0.0), 0);
+        assert_eq!(attention_grey(1.0), 255);
+    }
+
+    #[test]
+    fn renders_without_panic() {
+        for (w, h) in [(40, 12), (80, 24), (200, 60)] {
+            let mut a = App::new(CharTokenizer, 2, 2, StdRng::seed_from_u64(0));
+            render(&a, w, h);
+            a = running("abc");
+            loop {
+                render(&a, w, h);
+                let was_drawn = a.stage == Stage::Drawn;
+                press(&mut a, KeyCode::Enter);
+                if was_drawn {
+                    // committed: `drawn` is taken, the trace is not yet replaced
+                    assert!(a.drawn.is_none());
+                    render(&a, w, h);
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn renders_one_token() {
+        let mut a = running("a");
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.stage, Stage::Block(2));
+        render(&a, 80, 24);
+    }
+
+    #[test]
+    fn mode_badge_and_footer() {
+        let mut a = App::new(CharTokenizer, 2, 2, StdRng::seed_from_u64(0));
+        press(&mut a, KeyCode::Char('a'));
+        let text = render(&a, 120, 30);
+        assert!(text.contains("EDIT") && text.contains("type to edit"));
+        press(&mut a, KeyCode::Enter);
+        a.set_trace(fake_trace(1));
+        let text = render(&a, 120, 30);
+        assert!(text.contains("INFERENCE") && text.contains("Esc edit"));
+    }
+}

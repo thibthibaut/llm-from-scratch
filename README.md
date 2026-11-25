@@ -192,6 +192,38 @@ as is, and `--top-k 1` is the same as greedy. The sampler flags are rejected wit
 `--decoding sample`. In both modes each step shows the top-5 candidates (at temperature 1) and
 Enter accepts the default pick, so piping `< /dev/null` runs non-interactively.
 
+## Visualizer
+
+A terminal UI to type a prompt and step through one real forward pass of a trained model:
+
+```bash
+cargo run --release --bin visualize -- --config-path artifacts/config.json --model-path artifacts/model
+```
+
+`--device` defaults to `cpu`. Panels: prompt, token chips, embeddings (the last 8 tokens, each as
+16 PCA components of the token-embedding table) and attention (the last 8×8 window) at the chosen
+layer, the next-token distribution, and the sampler's filtered distribution.
+
+Two modes:
+
+- **EDIT**: type to edit, the token chips update live. Enter runs the forward pass, Ctrl+C quits.
+- **INFERENCE**: Enter steps embedding → block 1 … N → output → sampler → drawn; Enter on
+  `drawn` appends the token and runs a new pass.
+
+  | Key | Action |
+  |-----|--------|
+  | Enter | next stage |
+  | Space | jump to the sampler |
+  | ↑ / ↓ | layer (up to the block reached) |
+  | ← / → | head |
+  | t / T | temperature − / + 0.1 |
+  | k / K | top-k down / up (off, 1, 5, 10, 15, …) |
+  | p / P | top-p − / + 0.05 (off at 1) |
+  | Esc | back to EDIT, text kept |
+  | Ctrl+C | quit |
+
+The prompt is capped to its last 256 tokens for the model. Colors need a true-colour terminal.
+
 ## GPU training setup (RunPod, or any bare CUDA box)
 
 Notes from getting this running on a rented RunPod pod, kept here so a Dockerfile can be

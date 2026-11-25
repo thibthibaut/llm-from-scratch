@@ -156,6 +156,14 @@ impl<B: FusedOps> GPTModel<B> {
         trace
     }
 
+    pub fn num_layers(&self) -> usize {
+        self.transformer_layers.len()
+    }
+
+    pub fn num_heads(&self) -> usize {
+        self.transformer_layers.first().map_or(0, |b| b.mha.num_heads)
+    }
+
     /// The token embedding table, `[vocab, d_model]`.
     pub fn token_embedding_weights(&self) -> Tensor<B, 2> {
         self.embedding_layer.token_embedding.weight.val()
