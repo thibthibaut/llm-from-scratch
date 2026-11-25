@@ -13,16 +13,19 @@
 //!   choice is recorded in `artifacts/config.json`.
 //! - `inspect-batch [--batch-size N] [--context-size N]`: initialize the dataloader,
 //!   generate a single batch, detokenize it and display it.
-//! - `generate-text [--prompt "..."] [--max-new-tokens N] [--config-path PATH] [--model-path PATH]`:
-//!   load a trained model (default `artifacts/config.json` / `artifacts/model`) and run
-//!   inference with argmax, displaying the top-5 next-token probabilities at each step and
-//!   waiting for a key press to advance.
+//! - `generate-text [--prompt "..."] [--max-new-tokens N] [--config-path PATH] [--model-path PATH]
+//!   [--decoding greedy|sample] [--temperature T] [--top-k K] [--top-p P] [--seed N]`:
+//!   load a trained model (default `artifacts/config.json` / `artifacts/model`) and generate
+//!   with argmax (default) or by sampling, displaying the top-5 next-token probabilities at each
+//!   step and waiting for a key press to advance.
 
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 use crate::dataset::{
     TextBatch, TextBatcher, documents_per_batch, load_default_fineweb_dataset, split_dataset,
@@ -31,6 +34,7 @@ use crate::model::{
     EmbeddingModuleConfig, GPTModel, GPTModelConfig, MultiHeadAttentionConfig, Precision,
     TransformerBlockConfig,
 };
+use crate::sampling::{DecodingMode, Sampler};
 use crate::tokenizer::{AnyTokenizer, BpeTokenizer, SimpleTokenizer, Token, Tokenizer, TokenizerKind};
 use crate::training::{RunOptions, TrainingConfig};
 
@@ -232,6 +236,23 @@ enum Commands {
         /// Device to run inference on: `cpu`, `cuda` (or `cuda:N`), `mps`, `vulkan`.
         #[arg(long, default_value = "cpu", value_parser = parse_device)]
         device: LibTorchDevice,
+        /// How to pick each next token: `greedy` (argmax) or `sample` (draw from the model's
+        /// distribution, shaped by the flags below).
+        #[arg(long, value_enum, default_value_t = DecodingMode::Greedy)]
+        decoding: DecodingMode,
+        /// Sampling temperature (> 0): below 1 sharpens, above 1 flattens. Needs `--decoding sample`.
+        #[arg(long)]
+        temperature: Option<f32>,
+        /// Only draw from the K most likely tokens. Needs `--decoding sample`.
+        #[arg(long)]
+        top_k: Option<usize>,
+        /// Only draw from the smallest set of tokens whose total probability reaches P, in
+        /// (0, 1]. Needs `--decoding sample`.
+        #[arg(long)]
+        top_p: Option<f32>,
+        /// Seed for reproducible sampling (random if omitted). Needs `--decoding sample`.
+        #[arg(long)]
+        seed: Option<u64>,
     },
 }
 
@@ -473,16 +494,20 @@ fn run_inspect_batch(
     }
 }
 
-/// Generate text with a trained GPT model, one token at a time, using argmax
-/// sampling. At each step, the top-5 candidate next tokens (with their softmax
-/// probabilities) are printed and the user is prompted to press Enter to reveal
-/// the chosen next token.
+/// Generate text with a trained GPT model, one token at a time. Each step's default pick is the
+/// argmax (`DecodingMode::Greedy`) or a draw from `sampler` (`DecodingMode::Sample`). The top-5
+/// candidate next tokens (with their softmax probabilities at temperature 1) are printed and the
+/// user presses Enter to accept the default pick, or types 1-5 to take a candidate instead.
+#[allow(clippy::too_many_arguments)]
 fn run_generate_text(
     prompt: String,
     max_new_tokens: usize,
     config_path: String,
     model_path: String,
     device: LibTorchDevice,
+    decoding: DecodingMode,
+    sampler: Sampler,
+    seed: Option<u64>,
 ) {
     type MyBackend = LibTorch<f32>;
 
@@ -514,8 +539,19 @@ fn run_generate_text(
     }
 
     println!("Prompt: {}", tokenizer.decode(&tokens));
-    println!("Generating up to {max_new_tokens} tokens (argmax, top-5 shown each step).");
+    match decoding {
+        DecodingMode::Greedy => {
+            println!("Generating up to {max_new_tokens} tokens (argmax, top-5 shown each step).")
+        }
+        DecodingMode::Sample => println!(
+            "Generating up to {max_new_tokens} tokens (sampling: {sampler:?}, top-5 shown each step)."
+        ),
+    }
     println!();
+    let mut rng = match seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_entropy(),
+    };
 
     for step in 0..max_new_tokens {
         // Truncate context if needed
@@ -542,6 +578,9 @@ fn run_generate_text(
         ]);
         // Reshape to [vocab_size] for softmax
         let last_logits: Tensor<MyBackend, 1> = last_logits.reshape([vocab_size]);
+
+        // Raw logits feed the sampler, which applies its own temperature
+        let logits_data: Vec<f32> = last_logits.clone().into_data().to_vec().unwrap();
 
         // Softmax to get probabilities
         let probs = activation::softmax(last_logits, 0);
@@ -571,33 +610,51 @@ fn run_generate_text(
             );
         }
 
-        // Prompt the user to pick one of the top candidates, defaulting to #1
-        // (argmax). The loop re-prompts on invalid input. Typing `q` quits the
+        // The pick Enter accepts: the argmax, or a draw that may fall outside the top 5.
+        let (default_id, default_label, default_hint) = match decoding {
+            DecodingMode::Greedy => (top5[0].0, "default", "default 1"),
+            DecodingMode::Sample => {
+                let id = sampler.sample(&logits_data, &mut rng);
+                println!(
+                    "Sampled: \"{}\" (id={}, prob={:.4})",
+                    tokenizer
+                        .token_to_piece(Token(id as u32))
+                        .unwrap_or_else(|| "<invalid id>".to_string()),
+                    id,
+                    probs_data[id]
+                );
+                (id, "sampled", "Enter = sampled")
+            }
+        };
+
+        // Prompt the user to accept the default pick or choose one of the top
+        // candidates. The loop re-prompts on invalid input. Typing `q` quits the
         // whole generation, in which case the running text is still printed
         // below.
         let mut quit = false;
-        let choice: usize = loop {
+        let choice: Option<usize> = loop {
             print!(
-                "\nChoose a token (1-{}, default 1, or 'q' to quit): ",
+                "\nChoose a token (1-{}, {default_hint}, or 'q' to quit): ",
                 top5.len()
             );
             io::stdout().flush().unwrap();
             let mut line = String::new();
             if io::stdin().read_line(&mut line).is_err() {
-                // EOF on stdin: just default to argmax.
-                break 1;
+                // Unreadable stdin: take the default pick.
+                break None;
             }
             let trimmed = line.trim();
 
+            // Empty line, or EOF (read_line returns Ok(0)): take the default pick.
             if trimmed.is_empty() {
-                break 1;
+                break None;
             }
             if trimmed.eq_ignore_ascii_case("q") {
                 quit = true;
-                break 1; // value is unused; we break the for-loop below
+                break None; // value is unused; we break the for-loop below
             }
             match trimmed.parse::<usize>() {
-                Ok(n) if (1..=top5.len()).contains(&n) => break n,
+                Ok(n) if (1..=top5.len()).contains(&n) => break Some(n),
                 Ok(n) => println!(
                     "Invalid choice: {} (must be between 1 and {})",
                     n,
@@ -616,19 +673,25 @@ fn run_generate_text(
             break;
         }
 
-        // Pick the chosen candidate (1-indexed in the prompt, 0-indexed in `top5`)
-        let best_idx = top5[choice - 1].0;
+        // A typed choice is 1-indexed in the prompt, 0-indexed in `top5`
+        let (best_idx, label) = match choice {
+            Some(n) => (top5[n - 1].0, "user pick"),
+            None => (default_id, default_label),
+        };
         let next_token = Token(best_idx as u32);
         tokens.push(next_token);
 
-        let label = if choice == 1 { "default" } else { "user pick" };
+        let rank = match top5.iter().position(|&(id, _)| id == best_idx) {
+            Some(i) => format!("#{}", i + 1),
+            None => "outside top 5".to_string(),
+        };
         println!(
-            "Chosen: \"{}\" (id={}, #{}) [{}]",
+            "Chosen: \"{}\" (id={}, {}) [{}]",
             tokenizer
                 .token_to_piece(next_token)
                 .unwrap_or_else(|| "<invalid id>".to_string()),
             best_idx,
-            choice,
+            rank,
             label
         );
         println!("Text so far: {}", tokenizer.decode(&tokens));
@@ -710,6 +773,42 @@ fn main() {
             config_path,
             model_path,
             device,
-        } => run_generate_text(prompt, max_new_tokens, config_path, model_path, device),
+            decoding,
+            temperature,
+            top_k,
+            top_p,
+            seed,
+        } => {
+            let sampling_flag =
+                temperature.is_some() || top_k.is_some() || top_p.is_some() || seed.is_some();
+            if decoding == DecodingMode::Greedy && sampling_flag {
+                Cli::command()
+                    .error(
+                        clap::error::ErrorKind::ArgumentConflict,
+                        "--temperature, --top-k, --top-p and --seed require --decoding sample",
+                    )
+                    .exit();
+            }
+            let mut sampler = Sampler::default();
+            if let Some(t) = temperature {
+                sampler = sampler.with_temperature(t);
+            }
+            if let Some(k) = top_k {
+                sampler = sampler.with_top_k(k);
+            }
+            if let Some(p) = top_p {
+                sampler = sampler.with_top_p(p);
+            }
+            run_generate_text(
+                prompt,
+                max_new_tokens,
+                config_path,
+                model_path,
+                device,
+                decoding,
+                sampler,
+                seed,
+            )
+        }
     }
 }

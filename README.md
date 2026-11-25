@@ -171,6 +171,27 @@ The three modes train the same model: 300 steps from the same seed, data and ini
 reach validation losses of 7.3583 / 7.3582 / 7.3582 at step 100 and 6.8632 / 6.8632 / 6.8633 at
 step 300 (`f32` / `tf32` / `bf16`).
 
+## Generating text
+
+```bash
+cargo run --release -- generate-text --config-path artifacts/config.json --model-path artifacts/best-model \
+  --max-new-tokens 60 --prompt "Photosynthesis is"
+```
+
+By default each step picks the most likely token (`--decoding greedy`), which tends to loop on
+itself. `--decoding sample` draws from the model's distribution instead, shaped by:
+
+- `--temperature T` (> 0, default 1): below 1 sharpens towards the argmax, above 1 flattens;
+- `--top-k K`: only the K most likely tokens can be drawn;
+- `--top-p P` (in (0, 1]): only the smallest set of most likely tokens reaching probability P;
+- `--seed N`: makes the draws reproducible.
+
+They apply in that order, as in HF `transformers` and llama.cpp: temperature, softmax, top-k,
+top-p, then a draw from what is left. With no flags, `sample` draws from the model's distribution
+as is, and `--top-k 1` is the same as greedy. The sampler flags are rejected without
+`--decoding sample`. In both modes each step shows the top-5 candidates (at temperature 1) and
+Enter accepts the default pick, so piping `< /dev/null` runs non-interactively.
+
 ## GPU training setup (RunPod, or any bare CUDA box)
 
 Notes from getting this running on a rented RunPod pod, kept here so a Dockerfile can be
