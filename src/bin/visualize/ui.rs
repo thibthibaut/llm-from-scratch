@@ -542,7 +542,8 @@ mod tests {
     fn cut_marker_shown() {
         let mut a = running("abc");
         press(&mut a, KeyCode::Char(' '));
-        press(&mut a, KeyCode::Char('K'));
+        press(&mut a, KeyCode::Char('k'));
+        press(&mut a, KeyCode::Char('k'));
         assert_eq!(a.top_k, Some(1));
         assert!(render(&a, 120, 40).contains('✗'));
     }

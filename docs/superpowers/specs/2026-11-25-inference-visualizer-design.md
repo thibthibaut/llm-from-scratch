@@ -121,7 +121,7 @@ In inference mode the viewer is always at one stage:
   - `k`/`K`: top-k down/up through off → 1 → 5 → 10 → 15 → …, where 1 = greedy.
   - `p`/`P`: top-p ∓0.05, clamped to (0, 1], where 1.0 = off.
   - The panel redraws on every change. The draw happens only on Enter.
-  - Start with the `Sampler::default()` settings: T = 1, no k, no p.
+  - Start at T = 1, top-k 10, no p (changed 2026-11-25 after user testing: at T = 1 the tail outweighs the top 10, so unfiltered draws looked like bugs).
 
 ### Sampler support (in `src/sampling.rs`)
 

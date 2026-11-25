@@ -59,7 +59,8 @@ impl<T: Tokenizer> App<T> {
             layer: 0,
             head: 0,
             temperature: 1.0,
-            top_k: None,
+            // at T=1 this model's tail outweighs its top 10 (see README)
+            top_k: Some(10),
             top_p: None,
             trace: None,
             drawn: None,
@@ -384,6 +385,7 @@ mod tests {
         assert_eq!(a.temperature, 0.1);
         press(&mut a, 'T', 40);
         assert_eq!(a.temperature, 3.0);
+        a.top_k = None;
         for (c, want) in [
             ('K', Some(1)),
             ('K', Some(5)),
@@ -403,6 +405,7 @@ mod tests {
     #[test]
     fn top_k_steps_on_grid() {
         let mut a = at_sampler();
+        a.top_k = None;
         let mut up = vec![];
         for _ in 0..20 {
             a.on_key(key(KeyCode::Char('K')));
@@ -440,9 +443,17 @@ mod tests {
     }
 
     #[test]
+    fn starts_at_top_k_10() {
+        // a small model's T=1 tail holds most of the mass, so the app starts filtered
+        let a = at_sampler();
+        assert_eq!((a.temperature, a.top_k, a.top_p), (1.0, Some(10), None));
+    }
+
+    #[test]
     fn greedy_draw_with_top_k_1() {
         let mut a = at_sampler();
-        a.on_key(key(KeyCode::Char('K')));
+        a.on_key(key(KeyCode::Char('k')));
+        a.on_key(key(KeyCode::Char('k')));
         assert_eq!(a.top_k, Some(1));
         enter(&mut a);
         assert_eq!(a.drawn, Some(7));

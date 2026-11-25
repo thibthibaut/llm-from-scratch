@@ -217,10 +217,15 @@ Two modes:
   | ↑ / ↓ | layer (up to the block reached) |
   | ← / → | head |
   | t / T | temperature − / + 0.1 |
-  | k / K | top-k down / up (off, 1, 5, 10, 15, …) |
+  | k / K | top-k down / up (off, 1, 5, 10, 15, …; starts at 10) |
   | p / P | top-p − / + 0.05 (off at 1) |
   | Esc | back to EDIT, text kept |
   | Ctrl+C | quit |
+
+The sampler starts at T=1, top-k 10, top-p off: at T=1 this small model spreads most of its
+probability over the long tail (63% outside the top 10 after "The cat sat on the"), so an
+unfiltered draw usually lands on a token that looks improbable. Press `k` until top-k is off
+to sample the raw distribution.
 
 The prompt is capped to its last 256 tokens for the model. Colors need a true-colour terminal.
 
