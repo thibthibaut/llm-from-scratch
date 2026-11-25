@@ -53,6 +53,7 @@ mod dataset;
 mod loader;
 mod model;
 mod ops;
+mod sampling;
 mod tokenizer;
 mod training;
 
