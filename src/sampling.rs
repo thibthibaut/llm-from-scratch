@@ -34,34 +34,53 @@ pub struct Sampler {
 
 impl Default for Sampler {
     fn default() -> Self {
-        Self { temperature: 1.0, top_k: None, top_p: None }
+        Self {
+            temperature: 1.0,
+            top_k: None,
+            top_p: None,
+        }
     }
 }
 
 impl Sampler {
     /// Below 1 sharpens the distribution towards the argmax, above 1 flattens it.
     pub fn with_temperature(self, t: f32) -> Self {
-        assert!(t.is_finite() && t > 0.0, "temperature must be a finite number > 0, got {t}");
-        Self { temperature: t, ..self }
+        assert!(
+            t.is_finite() && t > 0.0,
+            "temperature must be a finite number > 0, got {t}"
+        );
+        Self {
+            temperature: t,
+            ..self
+        }
     }
 
     /// Only the `k` most likely tokens can be drawn. `with_top_k(1)` is greedy.
     pub fn with_top_k(self, k: usize) -> Self {
         assert!(k >= 1, "top_k must be >= 1");
-        Self { top_k: Some(k), ..self }
+        Self {
+            top_k: Some(k),
+            ..self
+        }
     }
 
     /// Only the smallest set of most likely tokens whose total probability reaches `p` can be
     /// drawn (nucleus sampling). The most likely token is always kept.
     pub fn with_top_p(self, p: f32) -> Self {
         assert!(p > 0.0 && p <= 1.0, "top_p must be in (0, 1], got {p}");
-        Self { top_p: Some(p), ..self }
+        Self {
+            top_p: Some(p),
+            ..self
+        }
     }
 
     /// Draw one token id from the last position's raw `logits` (length = vocab size).
     pub fn sample<R: Rng + ?Sized>(&self, logits: &[f32], rng: &mut R) -> usize {
         const INVALID: &str = "cannot sample: logits are not a valid distribution (NaN or empty)";
-        assert!(!logits.is_empty() && !logits.iter().any(|l| l.is_nan()), "{INVALID}");
+        assert!(
+            !logits.is_empty() && !logits.iter().any(|l| l.is_nan()),
+            "{INVALID}"
+        );
 
         // Subtracting the max keeps exp() from overflowing at low temperatures.
         let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -118,44 +137,77 @@ mod tests {
     #[test]
     fn default_matches_distribution() {
         let f = freq(Sampler::default(), &logits(&[0.7, 0.2, 0.1]), 20_000, 42);
-        assert!((f[0] - 0.7).abs() < 0.02 && (f[2] - 0.1).abs() < 0.02, "{f:?}");
+        assert!(
+            (f[0] - 0.7).abs() < 0.02 && (f[2] - 0.1).abs() < 0.02,
+            "{f:?}"
+        );
     }
 
     #[test]
     fn top_k_1_is_argmax() {
-        let f = freq(Sampler::default().with_top_k(1), &logits(&[0.2, 0.5, 0.3]), 500, 0);
+        let f = freq(
+            Sampler::default().with_top_k(1),
+            &logits(&[0.2, 0.5, 0.3]),
+            500,
+            0,
+        );
         assert_eq!(f, vec![0.0, 1.0, 0.0]);
     }
 
     #[test]
     fn top_k_2_never_picks_third() {
-        let f = freq(Sampler::default().with_top_k(2), &logits(&[0.5, 0.3, 0.2]), 5_000, 1);
+        let f = freq(
+            Sampler::default().with_top_k(2),
+            &logits(&[0.5, 0.3, 0.2]),
+            5_000,
+            1,
+        );
         assert_eq!(f[2], 0.0);
         assert!((f[0] - 0.625).abs() < 0.03, "{f:?}"); // 0.5 / 0.8 after renormalizing
     }
 
     #[test]
     fn top_p_cuts_tail() {
-        let f = freq(Sampler::default().with_top_p(0.85), &logits(&[0.6, 0.3, 0.1]), 5_000, 2);
+        let f = freq(
+            Sampler::default().with_top_p(0.85),
+            &logits(&[0.6, 0.3, 0.1]),
+            5_000,
+            2,
+        );
         assert_eq!(f[2], 0.0); // 0.6 + 0.3 = 0.9 >= 0.85
         assert!(f[1] > 0.0);
     }
 
     #[test]
     fn top_p_keeps_at_least_one() {
-        let f = freq(Sampler::default().with_top_p(0.1), &logits(&[0.6, 0.3, 0.1]), 500, 3);
+        let f = freq(
+            Sampler::default().with_top_p(0.1),
+            &logits(&[0.6, 0.3, 0.1]),
+            500,
+            3,
+        );
         assert_eq!(f[0], 1.0);
     }
 
     #[test]
     fn low_temperature_is_stable() {
-        let f = freq(Sampler::default().with_temperature(0.1), &[80.0, 79.0, 0.0], 500, 4);
+        let f = freq(
+            Sampler::default().with_temperature(0.1),
+            &[80.0, 79.0, 0.0],
+            500,
+            4,
+        );
         assert_eq!(f[0], 1.0); // (80-79)/0.1 = 10 nats apart, and no NaN
     }
 
     #[test]
     fn high_temperature_flattens() {
-        let f = freq(Sampler::default().with_temperature(100.0), &logits(&[0.9, 0.05, 0.05]), 20_000, 5);
+        let f = freq(
+            Sampler::default().with_temperature(100.0),
+            &logits(&[0.9, 0.05, 0.05]),
+            20_000,
+            5,
+        );
         assert!(f.iter().all(|&x| (x - 1.0 / 3.0).abs() < 0.03), "{f:?}");
     }
 
@@ -164,7 +216,10 @@ mod tests {
         // top_k(2) leaves [0.4, 0.35], renormalized to [0.533, 0.467]; top_p(0.5) then keeps only
         // index 0. Doing top-p first would keep {0, 1} (0.4 < 0.5 <= 0.75), so this pins the order.
         let s = Sampler::default().with_top_k(2).with_top_p(0.5);
-        assert_eq!(freq(s, &logits(&[0.4, 0.35, 0.25]), 500, 6), vec![1.0, 0.0, 0.0]);
+        assert_eq!(
+            freq(s, &logits(&[0.4, 0.35, 0.25]), 500, 6),
+            vec![1.0, 0.0, 0.0]
+        );
     }
 
     #[test]
