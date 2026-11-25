@@ -27,16 +27,19 @@ use clap::{CommandFactory, Parser, Subcommand};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-use crate::dataset::{
+use llm_from_scratch::dataset::{
     TextBatch, TextBatcher, documents_per_batch, load_default_fineweb_dataset, split_dataset,
 };
-use crate::model::{
-    EmbeddingModuleConfig, GPTModel, GPTModelConfig, MultiHeadAttentionConfig, Precision,
+use llm_from_scratch::model::{
+    EmbeddingModuleConfig, GPTModelConfig, MultiHeadAttentionConfig, Precision,
     TransformerBlockConfig,
 };
-use crate::sampling::{DecodingMode, Sampler};
-use crate::tokenizer::{AnyTokenizer, BpeTokenizer, SimpleTokenizer, Token, Tokenizer, TokenizerKind};
-use crate::training::{RunOptions, TrainingConfig};
+use llm_from_scratch::sampling::{DecodingMode, Sampler};
+use llm_from_scratch::tokenizer::{BpeTokenizer, SimpleTokenizer, Token, Tokenizer, TokenizerKind};
+use llm_from_scratch::training::{RunOptions, TrainingConfig};
+use llm_from_scratch::parse_device;
+use llm_from_scratch::tokenizer::load_tokenizer;
+use llm_from_scratch::inference::load_trained_model;
 
 use burn::Tensor;
 use burn::backend::Autodiff;
@@ -46,29 +49,10 @@ use burn::config::Config;
 use burn::data::dataloader::DataLoader;
 use burn::data::dataloader::Dataset;
 use burn::data::dataloader::DataLoaderBuilder;
-use burn::module::Module;
 use burn::optim::AdamWConfig;
-use burn::record::CompactRecorder;
-use burn::record::Recorder;
 use burn::tensor::Int;
 use burn::tensor::activation;
 
-mod dataset;
-mod loader;
-mod model;
-mod ops;
-mod sampling;
-mod tokenizer;
-mod training;
-
-/// Held by every test that draws from libtorch's global random generator (model init, random
-/// tensors). Tests run in parallel, and a test that seeds the generator and compares two
-/// training runs needs nothing else drawing from it in between.
-#[cfg(test)]
-pub fn torch_rng_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 const VOCAB_PATH: &str = "vocab.json";
 const TOKENIZER_PATH: &str = "tokenizer.json";
@@ -256,32 +240,6 @@ enum Commands {
     },
 }
 
-/// Parse a `--device` CLI value into a `LibTorchDevice`.
-fn parse_device(s: &str) -> Result<LibTorchDevice, String> {
-    let lower = s.to_ascii_lowercase();
-    match lower.as_str() {
-        "cpu" => Ok(LibTorchDevice::Cpu),
-        "mps" => Ok(LibTorchDevice::Mps),
-        "vulkan" => Ok(LibTorchDevice::Vulkan),
-        other => {
-            if let Some(idx) = other.strip_prefix("cuda") {
-                let idx = idx.trim_start_matches(':');
-                let index: usize = if idx.is_empty() {
-                    0
-                } else {
-                    idx.parse()
-                        .map_err(|_| format!("invalid CUDA device index in '{s}'"))?
-                };
-                Ok(LibTorchDevice::Cuda(index))
-            } else {
-                Err(format!(
-                    "unknown device '{s}': expected one of cpu, cuda[:N], mps, vulkan"
-                ))
-            }
-        }
-    }
-}
-
 /// Build the GPT model config from the given architecture parameters.
 fn gpt_model_config(
     vocab_size: usize,
@@ -357,17 +315,6 @@ fn train_tokenizer(vocab_size: usize, num_docs: usize, min_frequency: u64, outpu
     }
 }
 
-/// Resolve `--tokenizer` / `--tokenizer-path` into a loaded tokenizer and the path it came from.
-fn load_tokenizer(kind: TokenizerKind, path: Option<String>) -> (AnyTokenizer, String) {
-    let path = path.unwrap_or_else(|| kind.default_path().to_string());
-    let tokenizer = AnyTokenizer::load(kind, Path::new(&path));
-    println!(
-        "Tokenizer: {kind} from {path} ({} tokens)",
-        tokenizer.get_vocab_size()
-    );
-    (tokenizer, path)
-}
-
 /// Architecture and loop settings for `train`, as given on the command line.
 struct TrainArgs {
     d_model: usize,
@@ -425,7 +372,7 @@ fn run_train(args: TrainArgs) {
             .with_tokenizer_path(Some(tokenizer_path))
     };
 
-    crate::training::train_from_disk::<MyAutodiffBackend>(
+    llm_from_scratch::training::train_from_disk::<MyAutodiffBackend>(
         &args.artifact_dir,
         config,
         args.options,
@@ -511,26 +458,9 @@ fn run_generate_text(
 ) {
     type MyBackend = LibTorch<f32>;
 
-    // Load the saved config and trained model
-    let config = TrainingConfig::load(config_path)
-        .expect("Config should exist at --config-path; run `train` first");
-    let record = CompactRecorder::new()
-        .load(model_path.into(), &device)
-        .expect("Trained model should exist at --model-path; run `train` first");
-
-    let model: GPTModel<MyBackend> = config.model.init(&device).load_record(record);
+    let (config, model, tokenizer) = load_trained_model(&config_path, &model_path, &device);
     let context_length = config.model.embedding_config.context_size;
-
-    // The tokenizer comes from the saved config, never from a flag: decoding a checkpoint with
-    // a different tokenizer than it was trained on produces confident nonsense rather than an
-    // error, because the two id spaces overlap.
-    let (kind, path) = config.tokenizer_spec();
-    let (tokenizer, _) = load_tokenizer(kind, Some(path));
     let vocab_size = tokenizer.get_vocab_size();
-    assert_eq!(
-        vocab_size, config.model.embedding_config.vocab_size,
-        "tokenizer vocab size does not match the trained model's embedding vocab size"
-    );
 
     let mut tokens = tokenizer.encode(&prompt);
     if tokens.is_empty() {

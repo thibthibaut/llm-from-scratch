@@ -546,3 +546,14 @@ impl Tokenizer for AnyTokenizer {
         }
     }
 }
+
+/// Resolve `--tokenizer` / `--tokenizer-path` into a loaded tokenizer and the path it came from.
+pub fn load_tokenizer(kind: TokenizerKind, path: Option<String>) -> (AnyTokenizer, String) {
+    let path = path.unwrap_or_else(|| kind.default_path().to_string());
+    let tokenizer = AnyTokenizer::load(kind, Path::new(&path));
+    println!(
+        "Tokenizer: {kind} from {path} ({} tokens)",
+        tokenizer.get_vocab_size()
+    );
+    (tokenizer, path)
+}
