@@ -110,7 +110,7 @@ impl<T: Tokenizer> App<T> {
         }
         match key.code {
             KeyCode::Enter => return self.advance(),
-            KeyCode::Char(' ') => self.go(Stage::Sampler),
+            KeyCode::Char(' ') if self.stage != Stage::Drawn => self.go(Stage::Sampler),
             KeyCode::Esc => {
                 self.stage = Stage::Editing;
                 self.trace = None;
@@ -156,7 +156,7 @@ impl<T: Tokenizer> App<T> {
                 self.go(Stage::Drawn);
             }
             Stage::Drawn => {
-                self.tokens.push(Token(self.drawn? as u32));
+                self.tokens.push(Token(self.drawn.take()? as u32));
                 self.text = self.tokenizer.decode(&self.tokens);
                 return Some(Effect::RunForward);
             }
@@ -170,14 +170,14 @@ impl<T: Tokenizer> App<T> {
             't' => self.temperature = round_to(self.temperature - 0.1, 10.0).max(0.1),
             'T' => self.temperature = round_to(self.temperature + 0.1, 10.0).min(3.0),
             'k' | 'K' => {
-                // None, 1, 5, 10, 15, ... up to the vocab size
-                let max = self.tokenizer.get_vocab_size();
+                // None, 1, 5, 10, 15, ...
                 self.top_k = match (c, self.top_k) {
-                    ('k', Some(1)) | ('k', None) => None,
-                    ('k', Some(k)) => Some(if k == 5 { 1 } else { k - 5 }),
+                    ('k', None | Some(1)) => None,
+                    ('k', Some(5)) => Some(1),
+                    ('k', Some(k)) => Some(k - 5),
                     (_, None) => Some(1),
-                    (_, Some(1)) => Some(5.min(max)),
-                    (_, Some(k)) => Some((k + 5).min(max.max(k))),
+                    (_, Some(1)) => Some(5),
+                    (_, Some(k)) => Some(k + 5),
                 };
             }
             'p' => {
@@ -334,6 +334,7 @@ mod tests {
         assert!(a.is_editing());
         assert!(a.trace.is_none());
         assert_eq!(a.text, "ab");
+        assert!(a.drawn.is_none());
     }
 
     #[test]
@@ -389,6 +390,38 @@ mod tests {
         assert_eq!(a.top_p, Some(0.95));
         press(&mut a, 'P', 1);
         assert_eq!(a.top_p, None);
+    }
+
+    #[test]
+    fn top_k_steps_on_grid() {
+        let mut a = at_sampler();
+        let mut up = vec![];
+        for _ in 0..20 {
+            a.on_key(key(KeyCode::Char('K')));
+            up.push(a.top_k);
+        }
+        let grid: Vec<Option<usize>> = [1, 5]
+            .into_iter()
+            .chain((10..=95).step_by(5))
+            .map(Some)
+            .collect();
+        assert_eq!(up, grid);
+        for want in grid.iter().rev().skip(1).chain([&None]) {
+            a.on_key(key(KeyCode::Char('k')));
+            assert_eq!(&a.top_k, want);
+        }
+    }
+
+    #[test]
+    fn space_in_drawn_is_noop() {
+        let mut a = at_sampler();
+        enter(&mut a);
+        assert_eq!(a.stage, Stage::Drawn);
+        let drawn = a.drawn;
+        a.on_key(key(KeyCode::Char(' ')));
+        assert_eq!((a.stage, a.drawn), (Stage::Drawn, drawn));
+        assert_eq!(enter(&mut a), Some(Effect::RunForward));
+        assert_eq!(a.tokens.len(), 3);
     }
 
     #[test]
