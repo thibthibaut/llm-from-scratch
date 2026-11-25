@@ -2,7 +2,7 @@ use burn::Tensor;
 use burn::config::Config;
 use burn::nn::activation::{Activation, ActivationConfig};
 use burn::nn::{DropoutConfig, LayerNorm, LayerNormConfig, LinearConfig};
-use burn::tensor::{FloatDType, Int};
+use burn::tensor::{Bool, FloatDType, Int};
 use burn::{
     module::Module,
     nn::{Dropout, Embedding, EmbeddingConfig, Linear},
@@ -137,12 +137,53 @@ impl<B: FusedOps> GPTModel<B> {
     /// Logits, in the compute dtype of `precision` (bf16 logits are half the memory of the
     /// largest activation in the model; the loss upcasts them chunk by chunk).
     pub fn forward_with(&self, indices: Tensor<B, 2, Int>, precision: Precision) -> Tensor<B, 3> {
+        self.forward_impl(indices, precision, None)
+    }
+
+    /// One f32 forward pass over a single sequence (`indices` is `[1, seq]`), recording the
+    /// embeddings, every block's attention weights and residual stream, and the last logits.
+    pub fn forward_traced(&self, indices: Tensor<B, 2, Int>) -> Trace {
+        assert_eq!(
+            indices.dims()[0],
+            1,
+            "forward_traced takes a batch of one sequence"
+        );
+        let mut trace = Trace::default();
+        let logits = self.forward_impl(indices, Precision::F32, Some(&mut trace));
+        let [_, seq_len, vocab_size] = logits.dims();
+        trace.last_logits =
+            to_vecs(logits.slice([0..1, seq_len - 1..seq_len, 0..vocab_size])).remove(0);
+        trace
+    }
+
+    /// The token embedding table, `[vocab, d_model]`.
+    pub fn token_embedding_weights(&self) -> Tensor<B, 2> {
+        self.embedding_layer.token_embedding.weight.val()
+    }
+
+    fn forward_impl(
+        &self,
+        indices: Tensor<B, 2, Int>,
+        precision: Precision,
+        mut trace: Option<&mut Trace>,
+    ) -> Tensor<B, 3> {
         // 1. Pass through embeddings
         let mut x = self.embedding_layer.forward(indices);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.embedding = to_vecs(x.clone());
+        }
 
         // 2. Pass through all transformer blocks
         for layer in self.transformer_layers.iter() {
-            x = layer.forward_with(x, precision);
+            x = match trace.as_deref_mut() {
+                None => layer.forward_impl(x, precision, None),
+                Some(trace) => {
+                    let mut block = BlockTrace::default();
+                    let x = layer.forward_impl(x, precision, Some(&mut block));
+                    trace.blocks.push(block);
+                    x
+                }
+            };
         }
 
         // 3. Final layer norm
@@ -151,6 +192,37 @@ impl<B: FusedOps> GPTModel<B> {
         // 4. Output projection to vocabulary size
         linear_lowp(&self.out_head, x, precision)
     }
+}
+
+/// What `GPTModel::forward_traced` records, for batch 0, in f32.
+#[derive(Debug, Clone, Default)]
+pub struct Trace {
+    /// `[seq][d_model]`, token + position embedding.
+    pub embedding: Vec<Vec<f32>>,
+    /// One per transformer block, in order.
+    pub blocks: Vec<BlockTrace>,
+    /// `[vocab]`, logits at the last position.
+    pub last_logits: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BlockTrace {
+    /// `[heads][seq][seq]`, softmax(QKᵀ/√head_dim + causal mask).
+    pub attention: Vec<Vec<Vec<f32>>>,
+    /// `[seq][d_model]`, residual stream after the block.
+    pub residual: Vec<Vec<f32>>,
+}
+
+/// Batch 0 of a `[batch, rows, cols]` tensor, as f32 rows.
+fn to_vecs<B: Backend>(t: Tensor<B, 3>) -> Vec<Vec<f32>> {
+    let [_, _, cols] = t.dims();
+    let data: Vec<f32> = t
+        .slice(0..1)
+        .cast(FloatDType::F32)
+        .into_data()
+        .to_vec()
+        .unwrap();
+    data.chunks(cols).map(<[f32]>::to_vec).collect()
 }
 
 // --- Embedding layer ---
@@ -275,6 +347,16 @@ impl<B: FusedOps> MultiHeadAttention<B> {
     }
 
     pub fn forward_with(&self, sequence: Tensor<B, 3>, precision: Precision) -> Tensor<B, 3> {
+        self.forward_impl(sequence, precision, None)
+    }
+
+    /// `attention`, when given, receives batch 0's attention weights `[heads][seq][seq]`.
+    fn forward_impl(
+        &self,
+        sequence: Tensor<B, 3>,
+        precision: Precision,
+        attention: Option<&mut Vec<Vec<Vec<f32>>>>,
+    ) -> Tensor<B, 3> {
         // Input shape is [Batch Size, Sequence Lenght, Input Dimension]
         let [batch_size, seq_len, _d_model] = sequence.dims();
 
@@ -298,6 +380,22 @@ impl<B: FusedOps> MultiHeadAttention<B> {
                 .swap_dims(1, 2)
         };
         let (queries, keys, values) = (split_heads(queries), split_heads(keys), split_heads(values));
+
+        // The fused kernel below never materializes the weights, so recompute them from the
+        // same queries and keys.
+        if let Some(attention) = attention {
+            let q = queries.clone().cast(FloatDType::F32);
+            let k = keys.clone().cast(FloatDType::F32);
+            let scores = q.matmul(k.swap_dims(2, 3)) / (self.head_dim as f64).sqrt();
+            let future = Tensor::<B, 2, Bool>::tril_mask([seq_len, seq_len], 0, &scores.device());
+            let scores = scores.mask_fill(future.unsqueeze::<4>(), f32::NEG_INFINITY);
+            let weights = burn::tensor::activation::softmax(scores, 3)
+                .slice(0..1)
+                .squeeze_dim::<3>(0);
+            *attention = (0..self.num_heads)
+                .map(|h| to_vecs(weights.clone().slice(h..h + 1)))
+                .collect();
+        }
 
         // softmax(Q Kᵀ / √head_dim + causal mask) V, as one fused kernel (FlashAttention for
         // bf16, memory-efficient attention for f32). Writing it out op by op made autodiff keep
@@ -364,12 +462,22 @@ impl TransformerBlockConfig {
 
 impl<B: FusedOps> TransformerBlock<B> {
     pub fn forward_with(&self, x: Tensor<B, 3>, precision: Precision) -> Tensor<B, 3> {
+        self.forward_impl(x, precision, None)
+    }
+
+    fn forward_impl(
+        &self,
+        x: Tensor<B, 3>,
+        precision: Precision,
+        mut trace: Option<&mut BlockTrace>,
+    ) -> Tensor<B, 3> {
         let shortcut = x.clone();
 
         // Layer normalization
         let x = self.layer_norm1.forward(x);
         // Self attention
-        let x = self.mha.forward_with(x, precision);
+        let attention = trace.as_deref_mut().map(|t| &mut t.attention);
+        let x = self.mha.forward_impl(x, precision, attention);
 
         // let x = self.dropout1.forward(x);
 
@@ -389,7 +497,11 @@ impl<B: FusedOps> TransformerBlock<B> {
         // let x = self.dropout2.forward(x);
 
         // Add the residual
-        x + shortcut
+        let x = x + shortcut;
+        if let Some(trace) = trace {
+            trace.residual = to_vecs(x.clone());
+        }
+        x
     }
 }
 
@@ -523,5 +635,118 @@ mod tests {
             dropout_prob: 0.0,
         }
         .init::<TestBackend>(&device);
+    }
+
+    fn indices(
+        ids: &[i64],
+        device: &burn::backend::libtorch::LibTorchDevice,
+    ) -> Tensor<TestBackend, 2, Int> {
+        Tensor::<TestBackend, 1, Int>::from_data(ids, device).reshape([1, ids.len()])
+    }
+
+    #[test]
+    fn traced_logits_match_forward() {
+        let _rng = crate::torch_rng_lock();
+        let device = Default::default();
+        let model = test_gpt_config(4).init::<TestBackend>(&device);
+        let x = indices(&[0, 1, 2, 3], &device);
+
+        let expected: Vec<f32> = model
+            .forward(x.clone())
+            .slice([0..1, 3..4, 0..16])
+            .into_data()
+            .to_vec()
+            .unwrap();
+        let trace = model.forward_traced(x);
+
+        assert_eq!(trace.last_logits.len(), expected.len());
+        for (a, b) in trace.last_logits.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn traced_attention_is_causal_softmax() {
+        let _rng = crate::torch_rng_lock();
+        let device = Default::default();
+        let model = test_gpt_config(4).init::<TestBackend>(&device);
+        let trace = model.forward_traced(indices(&[0, 1, 2, 3], &device));
+
+        assert_eq!(trace.blocks.len(), 1);
+        let attention = &trace.blocks[0].attention;
+        assert_eq!(attention.len(), 2);
+        for head in attention {
+            assert_eq!(head.len(), 4);
+            for (i, row) in head.iter().enumerate() {
+                assert_eq!(row.len(), 4);
+                let sum: f32 = row.iter().sum();
+                assert!((sum - 1.0).abs() < 1e-4, "row {i} sums to {sum}");
+                for &w in &row[i + 1..] {
+                    assert_eq!(w, 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn traced_attention_reproduces_mha_output() {
+        let _rng = crate::torch_rng_lock();
+        let device = Default::default();
+        let mha = MultiHeadAttentionConfig::new(8)
+            .with_num_heads(2)
+            .with_dropout_prob(0.0)
+            .init::<TestBackend>(&device);
+        let x = Tensor::<TestBackend, 3>::random(
+            [1, 4, 8],
+            burn::tensor::Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+
+        let mut attention = Vec::new();
+        let expected = mha.forward_impl(x.clone(), Precision::F32, Some(&mut attention));
+
+        let weights: Vec<f32> = attention.into_iter().flatten().flatten().collect();
+        let weights =
+            Tensor::<TestBackend, 1>::from_data(weights.as_slice(), &device).reshape([1, 2, 4, 4]);
+        let v = mha
+            .value_weights
+            .forward(x)
+            .reshape([1, 4, 2, 4])
+            .swap_dims(1, 2);
+        let context = weights.matmul(v).swap_dims(1, 2).reshape([1, 4, 8]);
+        let rebuilt = mha.out_projection.forward(context);
+
+        let diff = (rebuilt - expected).abs().max().into_scalar();
+        assert!(diff < 1e-4, "rebuilt output differs by {diff}");
+    }
+
+    #[test]
+    fn traced_residual_shapes() {
+        let _rng = crate::torch_rng_lock();
+        let device = Default::default();
+        let model = test_gpt_config(4).init::<TestBackend>(&device);
+        let trace = model.forward_traced(indices(&[0, 1, 2, 3], &device));
+
+        assert_eq!(trace.embedding.len(), 4);
+        assert!(trace.embedding.iter().all(|row| row.len() == 8));
+        assert_eq!(trace.blocks[0].residual.len(), 4);
+        assert!(trace.blocks[0].residual.iter().all(|row| row.len() == 8));
+        assert_eq!(trace.last_logits.len(), 16);
+    }
+
+    #[test]
+    fn one_token_trace() {
+        let _rng = crate::torch_rng_lock();
+        let device = Default::default();
+        let model = test_gpt_config(4).init::<TestBackend>(&device);
+        let trace = model.forward_traced(indices(&[5], &device));
+
+        let attention = &trace.blocks[0].attention;
+        assert_eq!(attention.len(), 2);
+        for head in attention {
+            assert_eq!(head.len(), 1);
+            assert_eq!(head[0].len(), 1);
+            assert!((head[0][0] - 1.0).abs() < 1e-6);
+        }
     }
 }

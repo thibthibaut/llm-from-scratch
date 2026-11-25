@@ -1,11 +1,12 @@
+use burn::Tensor;
 use burn::backend::LibTorch;
 use burn::backend::libtorch::LibTorchDevice;
 use burn::config::Config;
 use burn::module::Module;
 use burn::record::{CompactRecorder, Recorder};
 
-use crate::model::GPTModel;
-use crate::tokenizer::{AnyTokenizer, Tokenizer, load_tokenizer};
+use crate::model::{GPTModel, Trace};
+use crate::tokenizer::{AnyTokenizer, Token, Tokenizer, load_tokenizer};
 use crate::training::TrainingConfig;
 
 /// Load a trained model, its saved config and the tokenizer that config names.
@@ -35,4 +36,16 @@ pub fn load_trained_model(
     );
 
     (config, model, tokenizer)
+}
+
+/// Trace one forward pass over `tokens` (already capped to the context size).
+pub fn trace_tokens(
+    model: &GPTModel<LibTorch<f32>>,
+    tokens: &[Token],
+    device: &LibTorchDevice,
+) -> Trace {
+    let ids: Vec<i64> = tokens.iter().map(|t| t.0 as i64).collect();
+    let indices = Tensor::<LibTorch<f32>, 1, burn::tensor::Int>::from_data(ids.as_slice(), device)
+        .reshape([1, ids.len()]);
+    model.forward_traced(indices)
 }
