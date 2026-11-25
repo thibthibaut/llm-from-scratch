@@ -42,6 +42,8 @@ impl Default for Sampler {
     }
 }
 
+const INVALID: &str = "cannot sample: logits are not a valid distribution (NaN or empty)";
+
 impl Sampler {
     /// Below 1 sharpens the distribution towards the argmax, above 1 flattens it.
     pub fn with_temperature(self, t: f32) -> Self {
@@ -74,9 +76,9 @@ impl Sampler {
         }
     }
 
-    /// Draw one token id from the last position's raw `logits` (length = vocab size).
-    pub fn sample<R: Rng + ?Sized>(&self, logits: &[f32], rng: &mut R) -> usize {
-        const INVALID: &str = "cannot sample: logits are not a valid distribution (NaN or empty)";
+    /// The tokens `sample` can draw, with their renormalized probabilities, most likely first.
+    /// Ties keep the lower id first.
+    pub fn distribution(&self, logits: &[f32]) -> Vec<(usize, f32)> {
         assert!(
             !logits.is_empty() && !logits.iter().any(|l| l.is_nan()),
             "{INVALID}"
@@ -109,8 +111,17 @@ impl Sampler {
             ranked.truncate(keep);
         }
 
-        // WeightedIndex normalizes by the sum, so the kept weights need no renormalizing.
-        let dist = WeightedIndex::new(ranked.iter().map(|&(_, w)| w)).expect(INVALID);
+        let total: f32 = ranked.iter().map(|&(_, w)| w).sum();
+        for r in &mut ranked {
+            r.1 /= total;
+        }
+        ranked
+    }
+
+    /// Draw one token id from the last position's raw `logits` (length = vocab size).
+    pub fn sample<R: Rng + ?Sized>(&self, logits: &[f32], rng: &mut R) -> usize {
+        let ranked = self.distribution(logits);
+        let dist = WeightedIndex::new(ranked.iter().map(|&(_, p)| p)).expect(INVALID);
         ranked[dist.sample(rng)].0
     }
 }
@@ -132,6 +143,41 @@ mod tests {
             c[s.sample(l, &mut rng)] += 1;
         }
         c.iter().map(|&x| x as f32 / n as f32).collect()
+    }
+
+    #[test]
+    fn distribution_sums_to_one() {
+        let d = Sampler::default().distribution(&logits(&[0.5, 0.3, 0.2]));
+        assert_eq!(d.iter().map(|&(i, _)| i).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!((d.iter().map(|&(_, p)| p).sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!((d[0].1 - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn distribution_applies_top_k_and_top_p() {
+        assert_eq!(
+            Sampler::default()
+                .with_top_k(2)
+                .distribution(&logits(&[0.5, 0.3, 0.2]))
+                .len(),
+            2
+        );
+        let d = Sampler::default()
+            .with_top_p(0.85)
+            .distribution(&logits(&[0.6, 0.3, 0.1]));
+        assert_eq!(d.len(), 2);
+        assert!((d[0].1 - 0.6 / 0.9).abs() < 1e-5);
+    }
+
+    #[test]
+    fn sample_draws_from_distribution() {
+        let s = Sampler::default().with_top_k(3).with_temperature(1.5);
+        let l = logits(&[0.4, 0.3, 0.2, 0.1]);
+        let kept: Vec<usize> = s.distribution(&l).iter().map(|&(i, _)| i).collect();
+        let mut rng = StdRng::seed_from_u64(9);
+        for _ in 0..500 {
+            assert!(kept.contains(&s.sample(&l, &mut rng)));
+        }
     }
 
     #[test]
