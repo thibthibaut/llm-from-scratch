@@ -37,6 +37,7 @@ pub struct App<T: Tokenizer> {
     rng: StdRng,
     num_layers: usize,
     num_heads: usize,
+    max_input: usize,
 }
 
 fn round_to(x: f32, scale: f32) -> f32 {
@@ -44,7 +45,13 @@ fn round_to(x: f32, scale: f32) -> f32 {
 }
 
 impl<T: Tokenizer> App<T> {
-    pub fn new(tokenizer: T, num_layers: usize, num_heads: usize, rng: StdRng) -> Self {
+    pub fn new(
+        tokenizer: T,
+        num_layers: usize,
+        num_heads: usize,
+        context_size: usize,
+        rng: StdRng,
+    ) -> Self {
         Self {
             text: String::new(),
             tokens: Vec::new(),
@@ -60,6 +67,7 @@ impl<T: Tokenizer> App<T> {
             rng,
             num_layers,
             num_heads,
+            max_input: MAX_MODEL_TOKENS.min(context_size),
         }
     }
 
@@ -68,7 +76,7 @@ impl<T: Tokenizer> App<T> {
     }
 
     pub fn model_input(&self) -> &[Token] {
-        &self.tokens[self.tokens.len().saturating_sub(MAX_MODEL_TOKENS)..]
+        &self.tokens[self.tokens.len().saturating_sub(self.max_input)..]
     }
 
     pub fn sampler(&self) -> Sampler {
@@ -250,7 +258,7 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
     fn app() -> App<CharTokenizer> {
-        App::new(CharTokenizer, 2, 2, StdRng::seed_from_u64(0))
+        App::new(CharTokenizer, 2, 2, 256, StdRng::seed_from_u64(0))
     }
     fn type_str(a: &mut App<CharTokenizer>, s: &str) {
         for c in s.chars() {
@@ -446,6 +454,14 @@ mod tests {
         type_str(&mut a, &"a".repeat(300));
         assert_eq!(a.model_input().len(), 256);
         assert_eq!(a.model_input(), &a.tokens[44..]);
+    }
+
+    #[test]
+    fn model_input_caps_at_context_size() {
+        let mut a = App::new(CharTokenizer, 2, 2, 16, StdRng::seed_from_u64(0));
+        type_str(&mut a, &"abcdefghij".repeat(4));
+        assert_eq!(a.model_input().len(), 16);
+        assert_eq!(a.model_input(), &a.tokens[24..]);
     }
 
     #[test]

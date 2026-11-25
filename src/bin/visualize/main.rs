@@ -24,7 +24,7 @@ struct Args {
 
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
-    let (_, model, tokenizer) =
+    let (config, model, tokenizer) =
         load_trained_model(&args.config_path, &args.model_path, &args.device);
     let table = model.token_embedding_weights();
     let [vocab, dim] = table.dims();
@@ -38,6 +38,7 @@ fn main() -> std::io::Result<()> {
         tokenizer,
         model.num_layers(),
         model.num_heads(),
+        config.model.embedding_config.context_size,
         StdRng::from_entropy(),
     );
 

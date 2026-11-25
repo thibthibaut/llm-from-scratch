@@ -13,8 +13,33 @@ pub const WINDOW: usize = 8;
 const TOP: usize = 10;
 const LABEL: usize = 8;
 
+/// GPT-2 `bytes_to_unicode` inverse: the byte a byte-level BPE char stands for.
+fn bpe_byte(c: char) -> Option<u8> {
+    let c = c as u32;
+    if matches!(c, 33..=126 | 161..=172 | 174..=255) {
+        return Some(c as u8);
+    }
+    let n = c.checked_sub(256)?;
+    (0..=255u32)
+        .filter(|b| !matches!(b, 33..=126 | 161..=172 | 174..=255))
+        .nth(n as usize)
+        .map(|b| b as u8)
+}
+
 pub fn display_piece(piece: &str) -> String {
-    piece.replace('Ġ', "␣").replace('Ċ', "↵")
+    let decoded = piece
+        .chars()
+        .map(bpe_byte)
+        .collect::<Option<Vec<u8>>>()
+        .map_or_else(
+            || piece.to_string(),
+            |b| String::from_utf8_lossy(&b).into_owned(),
+        );
+    decoded
+        .replace('Ġ', "␣")
+        .replace('Ċ', "↵")
+        .replace(' ', "␣")
+        .replace('\n', "↵")
 }
 
 /// 0 → mid-grey, ±`row_max_abs` → white / near-black.
@@ -48,8 +73,8 @@ pub fn draw<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca) {
         Constraint::Length(3),
         Constraint::Length(4),
         Constraint::Length(WINDOW as u16 + 3),
-        // sampler: header + top 10 + appended drawn row + borders
-        Constraint::Min(TOP as u16 + 4),
+        // sampler (header + top 10 + drawn row + borders = 14 rows) takes what is left
+        Constraint::Fill(1),
         Constraint::Length(2),
     ])
     .areas(frame.area());
@@ -199,14 +224,22 @@ fn attention_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
     };
     let start = weights.len().saturating_sub(WINDOW);
     let labels = window_labels(app, weights.len());
+    // Cells adapt to the panel: up to 3 shaded cols + 1 separator, down to 1 col.
+    let n = weights.len().min(WINDOW);
+    let step = (inner.width as usize)
+        .saturating_sub(LABEL)
+        .checked_div(n)
+        .unwrap_or(1)
+        .clamp(1, 4);
+    let (cell, sep) = if step > 1 { (step - 1, " ") } else { (1, "") };
     let mut header = vec![Span::raw(" ".repeat(LABEL))];
-    header.extend(labels.iter().map(|l| Span::raw(fit(l, 3) + " ")));
+    header.extend(labels.iter().map(|l| Span::raw(fit(l, cell) + sep)));
     let mut lines = vec![Line::from(header)];
     for (row, label) in weights[start..].iter().zip(&labels) {
         let mut spans = vec![Span::raw(fit(label, LABEL))];
         for &w in &row[start..] {
-            spans.push(Span::styled("   ", grey(attention_grey(w))));
-            spans.push(Span::raw(" "));
+            spans.push(Span::styled(" ".repeat(cell), grey(attention_grey(w))));
+            spans.push(Span::raw(sep));
         }
         lines.push(Line::from(spans));
     }
@@ -351,7 +384,7 @@ mod tests {
     }
     /// Typed `text`, ran, and got `fake_trace(text.len())`.
     fn running(text: &str) -> App<CharTokenizer> {
-        let mut a = App::new(CharTokenizer, 2, 2, StdRng::seed_from_u64(0));
+        let mut a = App::new(CharTokenizer, 2, 2, 256, StdRng::seed_from_u64(0));
         for c in text.chars() {
             press(&mut a, KeyCode::Char(c));
         }
@@ -377,6 +410,58 @@ mod tests {
     }
 
     #[test]
+    fn display_piece_decodes_bytes() {
+        assert_eq!(display_piece("Ã©"), "é");
+        assert_eq!(display_piece("âĢĻ"), "’");
+        assert_eq!(display_piece("ĠÃ©"), "␣é");
+        assert!(!display_piece("Ã").is_empty());
+    }
+
+    /// Right half (the attention panel at 80 cols) of the row after its title.
+    fn attention_header(text: &str) -> String {
+        let rows: Vec<Vec<char>> = text
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(80)
+            .map(|r| r.to_vec())
+            .collect();
+        let t = rows
+            .iter()
+            .position(|r| r[40..].iter().collect::<String>().contains("Attention"))
+            .unwrap();
+        rows[t + 1][40..].iter().collect()
+    }
+
+    #[test]
+    fn core_panels_visible_at_80x24() {
+        let mut a = running("abcdefgh");
+        while a.stage != Stage::Block(2) {
+            press(&mut a, KeyCode::Enter);
+        }
+        let text = render(&a, 80, 24);
+        assert!(text.contains("abcdefgh"));
+        assert!(text.contains("Embeddings"));
+        // CharTokenizer maps 'a'..'h' to pieces '!'..'(': first embedding row under the title
+        let rows: Vec<String> = text
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(80)
+            .map(|r| r.iter().collect())
+            .collect();
+        let e = rows.iter().position(|r| r.contains("Embeddings")).unwrap();
+        assert!(rows[e + 1].starts_with("│!"));
+        assert!(attention_header(&text).contains('!'));
+    }
+
+    #[test]
+    fn attention_last_column_visible_at_80_cols() {
+        let mut a = running("abcdefgh");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.stage, Stage::Block(1));
+        assert!(attention_header(&render(&a, 80, 24)).contains('('));
+    }
+
+    #[test]
     fn greys() {
         assert_eq!(embedding_grey(0.0, 2.0), 128);
         assert_eq!(embedding_grey(2.0, 2.0), 255);
@@ -389,7 +474,7 @@ mod tests {
     #[test]
     fn renders_without_panic() {
         for (w, h) in [(40, 12), (80, 24), (200, 60)] {
-            let mut a = App::new(CharTokenizer, 2, 2, StdRng::seed_from_u64(0));
+            let mut a = App::new(CharTokenizer, 2, 2, 256, StdRng::seed_from_u64(0));
             render(&a, w, h);
             a = running("abc");
             loop {
@@ -417,7 +502,7 @@ mod tests {
 
     #[test]
     fn mode_badge_and_footer() {
-        let mut a = App::new(CharTokenizer, 2, 2, StdRng::seed_from_u64(0));
+        let mut a = App::new(CharTokenizer, 2, 2, 256, StdRng::seed_from_u64(0));
         press(&mut a, KeyCode::Char('a'));
         let text = render(&a, 120, 30);
         assert!(text.contains("EDIT") && text.contains("type to edit"));
