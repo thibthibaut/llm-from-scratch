@@ -205,7 +205,10 @@ pub(crate) mod test_support {
             text.chars().map(|c| Token(c as u32 % 64)).collect()
         }
         fn decode(&self, tokens: &[Token]) -> String {
-            tokens.iter().map(|t| char::from_u32(t.0).unwrap()).collect()
+            tokens
+                .iter()
+                .map(|t| char::from_u32(t.0).unwrap())
+                .collect()
         }
         fn get_vocab_size(&self) -> usize {
             64
