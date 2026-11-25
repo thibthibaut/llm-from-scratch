@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 /// Tokens shown in the embedding and attention panels (the last ones of the input).
 pub const WINDOW: usize = 8;
@@ -43,17 +43,19 @@ fn fit(s: &str, w: usize) -> String {
 }
 
 pub fn draw<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca) {
-    let [title, prompt, tokens, middle, next, sampler, footer] = Layout::vertical([
+    let [title, prompt, tokens, middle, bottom, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(4),
         Constraint::Length(WINDOW as u16 + 3),
-        Constraint::Fill(1),
-        Constraint::Fill(1),
-        Constraint::Length(1),
+        // sampler: header + top 10 + appended drawn row + borders
+        Constraint::Min(TOP as u16 + 4),
+        Constraint::Length(2),
     ])
     .areas(frame.area());
     let [emb, att] = Layout::horizontal([Constraint::Fill(1); 2]).areas(middle);
+    let [next, sampler] =
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(bottom);
     title_bar(frame, app, title);
     prompt_panel(frame, app, prompt);
     tokens_panel(frame, app, tokens);
@@ -323,10 +325,10 @@ fn footer_bar<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
             "{stage} · Enter next · Space sampler · ↑↓ layer · ←→ head · t/T temp · k/K top-k · p/P top-p · Esc edit · Ctrl+C quit"
         )
     };
-    frame.render_widget(
-        Line::styled(text, Style::default().fg(Color::DarkGray)),
-        area,
-    );
+    let footer = Paragraph::new(text)
+        .style(Style::default().fg(Color::DarkGray))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(footer, area);
 }
 
 #[cfg(test)]
@@ -423,5 +425,40 @@ mod tests {
         a.set_trace(fake_trace(1));
         let text = render(&a, 120, 30);
         assert!(text.contains("INFERENCE") && text.contains("Esc edit"));
+    }
+
+    #[test]
+    fn footer_shows_exit_keys_at_80_cols() {
+        let text = render(&running("ab"), 80, 24);
+        assert!(text.contains("Esc edit") && text.contains("Ctrl+C quit"));
+    }
+
+    #[test]
+    fn output_panels_visible_at_120x40() {
+        let mut a = running("abc");
+        while a.stage != Stage::Drawn {
+            press(&mut a, KeyCode::Enter);
+        }
+        let text = render(&a, 120, 40);
+        assert!(text.contains("◀ drawn"));
+        // 9 near-zero tokens of the top 10: next-token bars + both sampler columns
+        assert!(text.matches("0.00").count() >= 27);
+    }
+
+    #[test]
+    fn stage_gating() {
+        let mut a = running("abc");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.stage, Stage::Block(1));
+        assert!(!render(&a, 120, 40).contains('█'));
+    }
+
+    #[test]
+    fn cut_marker_shown() {
+        let mut a = running("abc");
+        press(&mut a, KeyCode::Char(' '));
+        press(&mut a, KeyCode::Char('K'));
+        assert_eq!(a.top_k, Some(1));
+        assert!(render(&a, 120, 40).contains('✗'));
     }
 }
