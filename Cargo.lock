@@ -3852,6 +3852,7 @@ dependencies = [
  "clap",
  "indicatif",
  "rand 0.8.5",
+ "ratatui",
  "rayon",
  "regex",
  "serde",
