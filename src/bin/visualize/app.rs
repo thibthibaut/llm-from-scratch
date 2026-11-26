@@ -46,6 +46,7 @@ pub struct App<T: Tokenizer> {
     pub zoom_pos: usize, // absolute index into model_input() of the selected token
     pub show_scores: bool,
     pub window: usize,
+    pub zoom_window: usize,
     pub cache: Option<Vec<Vec<CacheTag>>>, // [layer][position] for the current trace
     prev_kv: Option<KvSnapshot>,
     rng: StdRng,
@@ -89,6 +90,7 @@ impl<T: Tokenizer> App<T> {
             num_heads,
             max_input: MAX_MODEL_TOKENS.min(context_size),
             window: 8,
+            zoom_window: 8,
         }
     }
 
@@ -123,14 +125,17 @@ impl<T: Tokenizer> App<T> {
         self.num_layers
     }
 
-    /// Tokens shown at once, set from the terminal size each frame.
-    pub fn set_window(&mut self, n: usize) {
-        self.window = n.max(1);
-        self.zoom_pos = self.zoom_pos.max(self.window_start());
+    /// Tokens shown at once in the main view and in the head zoom (which needs 2 rows per
+    /// token), set from the terminal size each frame.
+    pub fn set_window(&mut self, main: usize, zoom: usize) {
+        self.window = main.max(1);
+        self.zoom_window = zoom.max(1);
+        self.zoom_pos = self.zoom_pos.max(self.zoom_start());
     }
 
-    pub fn window_start(&self) -> usize {
-        self.model_input().len().saturating_sub(self.window)
+    /// First model-input position a zoom shows.
+    pub fn zoom_start(&self) -> usize {
+        self.model_input().len().saturating_sub(self.zoom_window)
     }
 
     pub fn set_trace(&mut self, trace: Trace) {
@@ -180,7 +185,7 @@ impl<T: Tokenizer> App<T> {
             }
             KeyCode::Esc if self.zoom != Zoom::Off => self.zoom = Zoom::Off,
             KeyCode::Up if self.zoom != Zoom::Off => {
-                self.zoom_pos = self.zoom_pos.saturating_sub(1).max(self.window_start())
+                self.zoom_pos = self.zoom_pos.saturating_sub(1).max(self.zoom_start())
             }
             KeyCode::Down if self.zoom != Zoom::Off => {
                 let last = self.model_input().len().saturating_sub(1);
@@ -599,10 +604,15 @@ mod tests {
             a.on_key(key(KeyCode::Up));
         }
         assert_eq!(a.zoom_pos, 2); // default window 8
-        a.set_window(3);
-        assert_eq!((a.window_start(), a.zoom_pos), (7, 7));
-        a.set_window(0);
-        assert_eq!(a.window, 1, "at least one token");
+        a.set_window(20, 3);
+        assert_eq!(
+            (a.zoom_start(), a.zoom_pos),
+            (7, 7),
+            "zoom follows its own window"
+        );
+        assert_eq!(a.window, 20, "main view keeps its own");
+        a.set_window(0, 0);
+        assert_eq!((a.window, a.zoom_window), (1, 1), "at least one token");
     }
 
     #[test]

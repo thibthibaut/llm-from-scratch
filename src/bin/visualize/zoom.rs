@@ -47,7 +47,7 @@ fn head_out(weights: &[f32], v: &[Vec<f32>], query: usize) -> Vec<f32> {
 
 pub(crate) fn head_zoom_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
     let input = app.model_input();
-    let (start, query) = (app.window_start(), app.zoom_pos);
+    let (start, query) = (app.zoom_start(), app.zoom_pos);
     let label = |p: usize| input.get(p).map_or(String::new(), |&t| piece(app, t));
     let title = format!(
         " Head {}·{} · query \"{}\" ",
@@ -169,7 +169,7 @@ fn cache_map<T: Tokenizer>(app: &App<T>, cache: Option<&[Vec<CacheTag>]>) -> Vec
     let mut lines = vec![Line::from(header)];
     for (l, tags) in cache.iter().enumerate().take(app.reached_layer()) {
         let mut row = vec![Span::raw(fit(&format!("layer {:2}", l + 1), ZOOM_LABEL))];
-        for &t in tags.get(app.window_start()..).unwrap_or(&[]) {
+        for &t in tags.get(app.zoom_start()..).unwrap_or(&[]) {
             let style = match t {
                 CacheTag::Read => grey(60),
                 CacheTag::Write => grey(230),

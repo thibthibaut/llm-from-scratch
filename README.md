@@ -204,8 +204,8 @@ cargo run --release --bin visualize -- --config-path artifacts/config.json --mod
 16 PCA components of the token-embedding table) and attention (the last N tokens as query rows,
 and as many earlier key columns as the width fits) at the chosen
 layer, and one "Next token" panel (the model's distribution and the sampler's filtered one). N is
-as many tokens as the terminal fits and follows resizes: 10 at the minimum size of 120×40, 20 at
-200×60.
+as many tokens as the terminal height fits and follows resizes: 13 at the minimum size of 120×40,
+30 at 200×60. The head zoom needs two rows per token, so it shows fewer (10 and 20).
 
 The title badge shows where you are:
 

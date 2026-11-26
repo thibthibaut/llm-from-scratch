@@ -71,15 +71,16 @@ pub(crate) fn fit(s: &str, w: usize) -> String {
     format!("{:w$}", s.chars().take(w).collect::<String>())
 }
 
-/// The most tokens every view can show at once in `area`: one embedding row each, a
-/// 3-column attention cell each in half the width, and k + v rows each in the head zoom.
-pub fn window_for(area: Rect) -> usize {
+/// How many tokens fit in `area`: (main view, head zoom). The main view needs one row per
+/// token and a 3-column attention cell each in half the width; the head zoom needs a k and a
+/// v row per token and a 5-column cache-map cell each.
+pub fn window_for(area: Rect) -> (usize, usize) {
     let (w, h) = (area.width as usize, area.height as usize);
     let rows = h.saturating_sub(27); // fixed panels + borders + header row
     let att = (w / 2).saturating_sub(2 + LABEL) / 3;
     let zoom_rows = h.saturating_sub(19) / 2; // q, headings, earlier rows, out, 2-row cache map
     let map_cols = w.saturating_sub(12) / 5;
-    rows.min(att).min(zoom_rows).min(map_cols).max(1)
+    (rows.min(att).max(1), zoom_rows.min(map_cols).max(1))
 }
 
 pub fn draw<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca) {
@@ -600,18 +601,20 @@ pub(crate) mod tests {
 
     #[test]
     fn window_fits_terminal() {
+        // (main view rows, head-zoom rows)
         let w = |x, y| window_for(Rect::new(0, 0, x, y));
-        assert_eq!(w(120, 40), 10);
-        assert_eq!(w(200, 60), 20);
-        assert_eq!(w(40, 12), 1);
-        assert!(w(300, 90) > w(200, 60));
+        assert_eq!(w(120, 40), (13, 10));
+        assert_eq!(w(200, 60), (30, 20));
+        assert_eq!(w(212, 56), (29, 18), "main view not capped by the zoom");
+        assert_eq!(w(40, 12), (1, 1));
+        assert!(w(300, 90).0 > w(200, 60).0);
     }
 
     #[test]
     fn attention_shows_more_keys_than_rows() {
         let mut a = running("abcdefghijklmnopqrst"); // 20 tokens
         press(&mut a, KeyCode::Enter); // Block(1)
-        a.set_window(8);
+        a.set_window(8, 8);
         // 120 wide: (58 inner - 8 label) / 3 = 16 key columns for 8 query rows.
         // CharTokenizer shows 'e' as '%' and 'd' as '$'.
         let h = attention_header(&render(&a, 120, 40));
@@ -643,7 +646,8 @@ pub(crate) mod tests {
     fn panels_follow_window() {
         let mut a = running("abcdefghijkl"); // 12 tokens
         press(&mut a, KeyCode::Enter); // Block(1)
-        a.set_window(window_for(Rect::new(0, 0, 200, 60)));
+        let (m, z) = window_for(Rect::new(0, 0, 200, 60));
+        a.set_window(m, z);
         // CharTokenizer maps 'a' to Token(33), shown as '!'
         let embedding_rows = |text: String| -> String {
             let rows: Vec<String> = text
@@ -659,7 +663,7 @@ pub(crate) mod tests {
             embedding_rows(render(&a, 120, 40)).contains('!'),
             "all 12 shown"
         );
-        a.set_window(8);
+        a.set_window(8, 8);
         assert!(
             !embedding_rows(render(&a, 120, 40)).contains('!'),
             "first 4 hidden"
