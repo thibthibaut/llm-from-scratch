@@ -1,4 +1,6 @@
 mod app;
+#[allow(dead_code)] // until Task 3 wires the cache tags into the app
+mod cache;
 mod pca;
 mod ui;
 
