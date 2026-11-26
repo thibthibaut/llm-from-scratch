@@ -46,6 +46,10 @@ fn main() -> std::io::Result<()> {
 
     let mut terminal = ratatui::init();
     let result = loop {
+        match terminal.size() {
+            Ok(size) => app.set_window(ui::window_for(size.into())),
+            Err(e) => break Err(e),
+        }
         if let Err(e) = terminal.draw(|f| ui::draw(f, &app, &pca)) {
             break Err(e);
         }

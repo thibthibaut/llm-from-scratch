@@ -1,4 +1,4 @@
-use crate::app::{App, Stage, WINDOW, Zoom};
+use crate::app::{App, Stage, Zoom};
 use crate::pca::Pca;
 use crate::zoom;
 use llm_from_scratch::sampling::Sampler;
@@ -71,12 +71,23 @@ pub(crate) fn fit(s: &str, w: usize) -> String {
     format!("{:w$}", s.chars().take(w).collect::<String>())
 }
 
+/// The most tokens every view can show at once in `area`: one embedding row each, a
+/// 3-column attention cell each in half the width, and k + v rows each in the head zoom.
+pub fn window_for(area: Rect) -> usize {
+    let (w, h) = (area.width as usize, area.height as usize);
+    let rows = h.saturating_sub(27); // fixed panels + borders + header row
+    let att = (w / 2).saturating_sub(2 + LABEL) / 3;
+    let zoom_rows = h.saturating_sub(19) / 2; // q, headings, earlier rows, out, 2-row cache map
+    let map_cols = w.saturating_sub(12) / 5;
+    rows.min(att).min(zoom_rows).min(map_cols).max(1)
+}
+
 pub fn draw<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca) {
     let [title, prompt, tokens, middle, output, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(4),
-        Constraint::Min(WINDOW as u16 + 3),
+        Constraint::Min(4),
         // header + top 10 + drawn row + borders
         Constraint::Length(14),
         Constraint::Length(2),
@@ -112,10 +123,14 @@ pub(crate) fn panel(frame: &mut Frame, area: Rect, title: String, style: Style) 
 }
 
 fn title_bar<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
-    let (badge, color) = if app.is_editing() {
-        (" EDIT ", Color::Yellow)
-    } else {
-        (" INFERENCE ", Color::Cyan)
+    let (badge, color) = match app.stage {
+        Stage::Editing => (" EDIT ".to_string(), Color::Yellow),
+        Stage::Embedding => (" EMBEDDING ".to_string(), Color::Magenta),
+        Stage::Block(n) => (
+            format!(" TRANSFORMER BLOCK {n}/{} ", app.num_layers()),
+            Color::Cyan,
+        ),
+        Stage::Output | Stage::Sampler | Stage::Drawn => (" SAMPLING ".to_string(), Color::Green),
     };
     let line = Line::from(vec![
         Span::styled(badge, Style::default().fg(Color::Black).bg(color)),
@@ -170,7 +185,7 @@ fn tokens_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
 pub(crate) fn window_labels<T: Tokenizer>(app: &App<T>, rows: usize) -> Vec<String> {
     let input = app.model_input();
     let offset = input.len().saturating_sub(rows);
-    (rows.saturating_sub(WINDOW)..rows)
+    (rows.saturating_sub(app.window)..rows)
         .map(|i| {
             input
                 .get(offset + i)
@@ -194,7 +209,7 @@ fn embeddings_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca, ar
             None => return,
         },
     };
-    let start = rows.len().saturating_sub(WINDOW);
+    let start = rows.len().saturating_sub(app.window);
     let labels = window_labels(app, rows.len());
     let lines: Vec<Line> = rows[start..]
         .iter()
@@ -239,7 +254,7 @@ fn attention_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
     else {
         return;
     };
-    let start = weights.len().saturating_sub(WINDOW);
+    let start = weights.len().saturating_sub(app.window);
     let labels = window_labels(app, weights.len());
     let scores = app
         .show_scores
@@ -253,7 +268,7 @@ fn attention_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
             .fold(0.0f32, |m, v| m.max(v.abs()))
     });
     // Cells adapt to the panel: up to 3 shaded cols + 1 separator, down to 1 col.
-    let n = weights.len().min(WINDOW);
+    let n = weights.len().min(app.window);
     let step = (inner.width as usize)
         .saturating_sub(LABEL)
         .checked_div(n)
@@ -558,7 +573,49 @@ pub(crate) mod tests {
         press(&mut a, KeyCode::Enter);
         a.set_trace(fake_trace(1));
         let text = render(&a, 120, 30);
-        assert!(text.contains("INFERENCE") && text.contains("Esc edit"));
+        assert!(text.contains("EMBEDDING") && text.contains("Esc edit"));
+    }
+
+    #[test]
+    fn stage_badges() {
+        let mut a = running("abc");
+        assert!(render(&a, 120, 40).contains(" EMBEDDING "));
+        press(&mut a, KeyCode::Enter);
+        assert!(render(&a, 120, 40).contains(" TRANSFORMER BLOCK 1/2 "));
+        press(&mut a, KeyCode::Enter);
+        assert!(render(&a, 120, 40).contains(" TRANSFORMER BLOCK 2/2 "));
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Enter);
+            assert!(render(&a, 120, 40).contains(" SAMPLING "), "{:?}", a.stage);
+        }
+        press(&mut a, KeyCode::Esc);
+        assert!(render(&a, 120, 40).contains(" EDIT "));
+    }
+
+    #[test]
+    fn window_fits_terminal() {
+        let w = |x, y| window_for(Rect::new(0, 0, x, y));
+        assert_eq!(w(120, 40), 10);
+        assert_eq!(w(200, 60), 20);
+        assert_eq!(w(40, 12), 1);
+        assert!(w(300, 90) > w(200, 60));
+    }
+
+    #[test]
+    fn panels_follow_window() {
+        let mut a = running("abcdefghijkl"); // 12 tokens
+        press(&mut a, KeyCode::Enter); // Block(1)
+        a.set_window(window_for(Rect::new(0, 0, 200, 60)));
+        // CharTokenizer maps 'a' to Token(33), shown as '!'
+        assert!(
+            attention_header(&render(&a, 120, 40)).contains('!'),
+            "all 12 shown"
+        );
+        a.set_window(8);
+        assert!(
+            !attention_header(&render(&a, 120, 40)).contains('!'),
+            "first 4 hidden"
+        );
     }
 
     #[test]

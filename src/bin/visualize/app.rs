@@ -6,8 +6,6 @@ use rand::rngs::StdRng;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub const MAX_MODEL_TOKENS: usize = 256;
-/// Tokens shown in the embedding and attention panels (the last ones of the input).
-pub const WINDOW: usize = 8;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Zoom {
@@ -47,6 +45,7 @@ pub struct App<T: Tokenizer> {
     pub zoom: Zoom,
     pub zoom_pos: usize, // absolute index into model_input() of the selected token
     pub show_scores: bool,
+    pub window: usize,
     pub cache: Option<Vec<Vec<CacheTag>>>, // [layer][position] for the current trace
     prev_kv: Option<KvSnapshot>,
     rng: StdRng,
@@ -89,6 +88,7 @@ impl<T: Tokenizer> App<T> {
             num_layers,
             num_heads,
             max_input: MAX_MODEL_TOKENS.min(context_size),
+            window: 8,
         }
     }
 
@@ -119,8 +119,18 @@ impl<T: Tokenizer> App<T> {
         }
     }
 
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    /// Tokens shown at once, set from the terminal size each frame.
+    pub fn set_window(&mut self, n: usize) {
+        self.window = n.max(1);
+        self.zoom_pos = self.zoom_pos.max(self.window_start());
+    }
+
     pub fn window_start(&self) -> usize {
-        self.model_input().len().saturating_sub(WINDOW)
+        self.model_input().len().saturating_sub(self.window)
     }
 
     pub fn set_trace(&mut self, trace: Trace) {
@@ -575,6 +585,24 @@ mod tests {
         // a small model's T=1 tail holds most of the mass, so the app starts filtered
         let a = at_sampler();
         assert_eq!((a.temperature, a.top_k, a.top_p), (1.0, Some(10), None));
+    }
+
+    #[test]
+    fn set_window_clamps_zoom_pos() {
+        let mut a = app();
+        type_str(&mut a, "abcdefghij");
+        enter(&mut a);
+        a.set_trace(fake_trace(10));
+        enter(&mut a); // Block(1)
+        a.on_key(key(KeyCode::Char('z')));
+        for _ in 0..9 {
+            a.on_key(key(KeyCode::Up));
+        }
+        assert_eq!(a.zoom_pos, 2); // default window 8
+        a.set_window(3);
+        assert_eq!((a.window_start(), a.zoom_pos), (7, 7));
+        a.set_window(0);
+        assert_eq!(a.window, 1, "at least one token");
     }
 
     #[test]

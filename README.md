@@ -200,16 +200,18 @@ A terminal UI to type a prompt and step through one real forward pass of a train
 cargo run --release --bin visualize -- --config-path artifacts/config.json --model-path artifacts/model
 ```
 
-`--device` defaults to `cpu`. Panels: prompt, token chips, embeddings (the last 8 tokens, each as
-16 PCA components of the token-embedding table) and attention (the last 8×8 window) at the chosen
-layer, and one "Next token" panel (the model's distribution and the sampler's filtered one). The minimum
-terminal size is 120×40.
+`--device` defaults to `cpu`. Panels: prompt, token chips, embeddings (the last N tokens, each as
+16 PCA components of the token-embedding table) and attention (the last N×N window) at the chosen
+layer, and one "Next token" panel (the model's distribution and the sampler's filtered one). N is
+as many tokens as the terminal fits and follows resizes: 10 at the minimum size of 120×40, 20 at
+200×60.
 
-Two modes:
+The title badge shows where you are:
 
 - **EDIT**: type to edit, the token chips update live. Enter runs the forward pass, Ctrl+C quits.
-- **INFERENCE**: Enter steps embedding → block 1 … N → output → sampler → drawn; Enter on
-  `drawn` appends the token and runs a new pass.
+- **EMBEDDING**, **TRANSFORMER BLOCK n/N**, **SAMPLING**: Enter steps embedding → block 1 … N →
+  output → sampler → drawn (the last three are SAMPLING); Enter on `drawn` appends the token and
+  runs a new pass. Keys are commands here, not text.
 
   | Key | Action |
   |-----|--------|
