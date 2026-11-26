@@ -1,4 +1,4 @@
-use crate::app::{App, Stage, WINDOW};
+use crate::app::{App, Stage, WINDOW, Zoom};
 use crate::pca::Pca;
 use llm_from_scratch::sampling::Sampler;
 use llm_from_scratch::tokenizer::{Token, Tokenizer};
@@ -48,6 +48,11 @@ pub fn embedding_grey(v: f32, row_max_abs: f32) -> u8 {
     (128.0 + 127.0 * v / row_max_abs).round().clamp(0.0, 255.0) as u8
 }
 
+/// Diverging grey for a pre-softmax score; masked cells are not passed in.
+pub fn score_grey(s: f32, max_abs: f32) -> u8 {
+    embedding_grey(s, max_abs)
+}
+
 pub fn attention_grey(w: f32) -> u8 {
     (255.0 * w).round().clamp(0.0, 255.0) as u8
 }
@@ -66,27 +71,37 @@ fn fit(s: &str, w: usize) -> String {
 }
 
 pub fn draw<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca) {
-    let [title, prompt, tokens, middle, bottom, footer] = Layout::vertical([
+    let [title, prompt, tokens, middle, output, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(4),
-        Constraint::Length(WINDOW as u16 + 3),
-        // sampler (header + top 10 + drawn row + borders = 14 rows) takes what is left
-        Constraint::Fill(1),
+        Constraint::Min(WINDOW as u16 + 3),
+        // header + top 10 + drawn row + borders
+        Constraint::Length(14),
         Constraint::Length(2),
     ])
     .areas(frame.area());
-    let [emb, att] = Layout::horizontal([Constraint::Fill(1); 2]).areas(middle);
-    let [next, sampler] =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(bottom);
     title_bar(frame, app, title);
     prompt_panel(frame, app, prompt);
     tokens_panel(frame, app, tokens);
-    embeddings_panel(frame, app, pca, emb);
-    attention_panel(frame, app, att);
-    next_token_panel(frame, app, next);
-    sampler_panel(frame, app, sampler);
+    if app.zoom == Zoom::Off {
+        let [emb, att] = Layout::horizontal([Constraint::Fill(1); 2]).areas(middle);
+        embeddings_panel(frame, app, pca, emb);
+        attention_panel(frame, app, att);
+        output_panel(frame, app, output);
+    } else {
+        zoom_panel(frame, app, middle.union(output));
+    }
     footer_bar(frame, app, footer);
+}
+
+/// Placeholder: the zoom takes the middle band and the output rows.
+fn zoom_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
+    let title = match app.zoom {
+        Zoom::Head => " Head zoom ",
+        _ => " MLP zoom ",
+    };
+    panel(frame, area, title.into(), Style::default());
 }
 
 /// Renders a titled block and returns its inner area.
@@ -208,7 +223,12 @@ fn attention_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
     let inner = panel(
         frame,
         area,
-        format!(" Attention  layer {} · head {} ", app.layer, app.head + 1),
+        format!(
+            " Attention  layer {} · head {} · {} ",
+            app.layer,
+            app.head + 1,
+            if app.show_scores { "scores" } else { "weights" }
+        ),
         Style::default(),
     );
     let Some(trace) = &app.trace else { return };
@@ -222,6 +242,17 @@ fn attention_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
     };
     let start = weights.len().saturating_sub(WINDOW);
     let labels = window_labels(app, weights.len());
+    let scores = app
+        .show_scores
+        .then(|| &trace.blocks[app.layer - 1].scores[app.head]);
+    // scale by the visible window's largest finite |score|
+    let max = scores.map_or(0.0, |sc| {
+        sc[start..]
+            .iter()
+            .flat_map(|r| &r[start..])
+            .filter(|v| v.is_finite())
+            .fold(0.0f32, |m, v| m.max(v.abs()))
+    });
     // Cells adapt to the panel: up to 3 shaded cols + 1 separator, down to 1 col.
     let n = weights.len().min(WINDOW);
     let step = (inner.width as usize)
@@ -233,10 +264,15 @@ fn attention_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
     let mut header = vec![Span::raw(" ".repeat(LABEL))];
     header.extend(labels.iter().map(|l| Span::raw(fit(l, cell) + sep)));
     let mut lines = vec![Line::from(header)];
-    for (row, label) in weights[start..].iter().zip(&labels) {
+    for (i, (row, label)) in weights[start..].iter().zip(&labels).enumerate() {
         let mut spans = vec![Span::raw(fit(label, LABEL))];
-        for &w in &row[start..] {
-            spans.push(Span::styled(" ".repeat(cell), grey(attention_grey(w))));
+        for (j, &w) in row[start..].iter().enumerate() {
+            let g = match scores {
+                Some(_) if j > i => 0, // masked
+                Some(sc) => score_grey(sc[start + i][start + j], max),
+                None => attention_grey(w),
+            };
+            spans.push(Span::styled(" ".repeat(cell), grey(g)));
             spans.push(Span::raw(sep));
         }
         lines.push(Line::from(spans));
@@ -264,35 +300,16 @@ fn logits_from<T: Tokenizer>(app: &App<T>, from: Stage) -> Option<&[f32]> {
     (order(app.stage) >= order(from)).then_some(app.trace.as_ref()?.last_logits.as_slice())
 }
 
-fn next_token_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
-    let inner = panel(frame, area, " Next token ".into(), Style::default());
-    let Some(logits) = logits_from(app, Stage::Output) else {
-        return;
-    };
-    let width = (inner.width as usize).saturating_sub(LABEL + 6);
-    let lines: Vec<Line> = Sampler::default()
-        .distribution(logits)
-        .into_iter()
-        .take(TOP)
-        .map(|(id, p)| {
-            let mut spans = vec![Span::raw(fit(&piece(app, Token(id as u32)), LABEL))];
-            spans.extend(bar(p, width, Style::default().fg(Color::Cyan)));
-            Line::from(spans)
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-fn sampler_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
+fn output_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
     let off = |o: Option<String>| o.unwrap_or_else(|| "off".into());
     let title = format!(
-        " Sampler  T={:.1}  top-k {}  top-p {} ",
+        " Next token · T={:.1} top-k {} top-p {} ",
         app.temperature,
         off(app.top_k.map(|k| k.to_string())),
         off(app.top_p.map(|p| format!("{p:.2}"))),
     );
     let inner = panel(frame, area, title, Style::default());
-    let Some(logits) = logits_from(app, Stage::Sampler) else {
+    let Some(logits) = logits_from(app, Stage::Output) else {
         return;
     };
     let model = Sampler::default().distribution(logits);
@@ -352,8 +369,18 @@ fn footer_bar<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
             Stage::Drawn => "drawn".into(),
             Stage::Embedding | Stage::Editing => "embedding".into(),
         };
+        let keys = match app.zoom {
+            Zoom::Off => "Space sampler · ↑↓ layer · ←→ head · z head · m mlp · s scores",
+            Zoom::Head => "↑↓ query · ←→ head · [ ] layer · m mlp · z/Esc close",
+            Zoom::Mlp => "↑↓ token · [ ] layer · z head · m/Esc close",
+        };
+        let tail = if app.zoom == Zoom::Off {
+            " · Esc edit"
+        } else {
+            ""
+        };
         format!(
-            "{stage} · Enter next · Space sampler · ↑↓ layer · ←→ head · t/T temp · k/K top-k · p/P top-p · Esc edit · Ctrl+C quit"
+            "{stage} · Enter next · {keys} · t/T temp · k/K top-k · p/P top-p{tail} · Ctrl+C quit"
         )
     };
     let footer = Paragraph::new(text)
@@ -415,35 +442,35 @@ mod tests {
         assert!(!display_piece("Ã").is_empty());
     }
 
-    /// Right half (the attention panel at 80 cols) of the row after its title.
+    /// Right half (the attention panel at 120 cols) of the row after its title.
     fn attention_header(text: &str) -> String {
         let rows: Vec<Vec<char>> = text
             .chars()
             .collect::<Vec<_>>()
-            .chunks(80)
+            .chunks(120)
             .map(|r| r.to_vec())
             .collect();
         let t = rows
             .iter()
-            .position(|r| r[40..].iter().collect::<String>().contains("Attention"))
+            .position(|r| r[60..].iter().collect::<String>().contains("Attention"))
             .unwrap();
-        rows[t + 1][40..].iter().collect()
+        rows[t + 1][60..].iter().collect()
     }
 
     #[test]
-    fn core_panels_visible_at_80x24() {
+    fn core_panels_visible_at_120x40() {
         let mut a = running("abcdefgh");
         while a.stage != Stage::Block(2) {
             press(&mut a, KeyCode::Enter);
         }
-        let text = render(&a, 80, 24);
+        let text = render(&a, 120, 40);
         assert!(text.contains("abcdefgh"));
         assert!(text.contains("Embeddings"));
         // CharTokenizer maps 'a'..'h' to pieces '!'..'(': first embedding row under the title
         let rows: Vec<String> = text
             .chars()
             .collect::<Vec<_>>()
-            .chunks(80)
+            .chunks(120)
             .map(|r| r.iter().collect())
             .collect();
         let e = rows.iter().position(|r| r.contains("Embeddings")).unwrap();
@@ -452,11 +479,11 @@ mod tests {
     }
 
     #[test]
-    fn attention_last_column_visible_at_80_cols() {
+    fn attention_last_column_visible_at_120_cols() {
         let mut a = running("abcdefgh");
         press(&mut a, KeyCode::Enter);
         assert_eq!(a.stage, Stage::Block(1));
-        assert!(attention_header(&render(&a, 80, 24)).contains('('));
+        assert!(attention_header(&render(&a, 120, 40)).contains('('));
     }
 
     #[test]
@@ -524,8 +551,63 @@ mod tests {
         }
         let text = render(&a, 120, 40);
         assert!(text.contains("◀ drawn"));
-        // 9 near-zero tokens of the top 10: next-token bars + both sampler columns
-        assert!(text.matches("0.00").count() >= 27);
+        // 9 near-zero tokens of the top 10: both columns of the merged panel
+        assert!(text.matches("0.00").count() >= 18);
+    }
+
+    #[test]
+    fn score_grey_diverges() {
+        assert_eq!(score_grey(0.0, 2.0), 128);
+        assert_eq!(score_grey(2.0, 2.0), 255);
+        assert_eq!(score_grey(-2.0, 2.0), 1);
+        assert_eq!(score_grey(1.0, 0.0), 128);
+    }
+
+    #[test]
+    fn output_panel_merged() {
+        let mut a = running("abc");
+        while a.stage != Stage::Drawn {
+            press(&mut a, KeyCode::Enter);
+        }
+        let text = render(&a, 120, 40);
+        assert!(text.contains("Next token · T=1.0"));
+        assert!(text.contains("◀ drawn"));
+        assert!(!text.contains(" Sampler "));
+    }
+
+    #[test]
+    fn output_columns_from_output_stage() {
+        let mut a = running("abc");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.stage, Stage::Block(1));
+        assert!(!render(&a, 120, 40).contains('█'));
+        while a.stage != Stage::Output {
+            press(&mut a, KeyCode::Enter);
+        }
+        press(&mut a, KeyCode::Char('k'));
+        press(&mut a, KeyCode::Char('k'));
+        assert_eq!(a.top_k, Some(1));
+        assert!(render(&a, 120, 40).contains("✗ cut"));
+    }
+
+    #[test]
+    fn attention_title_shows_mode() {
+        let mut a = running("abc");
+        press(&mut a, KeyCode::Enter);
+        assert!(render(&a, 120, 40).contains("weights"));
+        press(&mut a, KeyCode::Char('s'));
+        assert!(render(&a, 120, 40).contains("scores"));
+    }
+
+    #[test]
+    fn footer_lists_zoom_keys() {
+        let mut a = running("abc");
+        press(&mut a, KeyCode::Enter);
+        assert!(render(&a, 120, 40).contains("z head · m mlp · s scores"));
+        press(&mut a, KeyCode::Char('z'));
+        assert!(render(&a, 120, 40).contains("z/Esc close"));
+        press(&mut a, KeyCode::Char('m'));
+        assert!(render(&a, 120, 40).contains("m/Esc close"));
     }
 
     #[test]
