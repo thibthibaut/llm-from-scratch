@@ -219,6 +219,18 @@ pub struct BlockTrace {
     pub attention: Vec<Vec<Vec<f32>>>,
     /// `[seq][d_model]`, residual stream after the block.
     pub residual: Vec<Vec<f32>>,
+    /// `[heads][seq][head_dim]`, the split-head queries, keys and values.
+    pub q: Vec<Vec<Vec<f32>>>,
+    pub k: Vec<Vec<Vec<f32>>>,
+    pub v: Vec<Vec<Vec<f32>>>,
+    /// `[heads][seq][seq]`, QKᵀ/√head_dim, masked (future) cells are `f32::NEG_INFINITY`.
+    pub scores: Vec<Vec<Vec<f32>>>,
+    /// `[seq][d_model]`, layer_norm2 output (the MLP input).
+    pub mlp_in: Vec<Vec<f32>>,
+    /// `[seq][ff_dim]`, activation output.
+    pub mlp_hidden: Vec<Vec<f32>>,
+    /// `[seq][d_model]`, linear2 output (added to the residual).
+    pub mlp_out: Vec<Vec<f32>>,
 }
 
 /// Batch 0 of a `[batch, rows, cols]` tensor, as f32 rows.
@@ -231,6 +243,15 @@ fn to_vecs<B: Backend>(t: Tensor<B, 3>) -> Vec<Vec<f32>> {
         .to_vec()
         .unwrap();
     data.chunks(cols).map(<[f32]>::to_vec).collect()
+}
+
+/// Batch 0 of a `[batch, heads, rows, cols]` tensor, as f32, with one device sync.
+fn to_heads<B: Backend>(t: Tensor<B, 4>) -> Vec<Vec<Vec<f32>>> {
+    let [_, heads, rows, cols] = t.dims();
+    to_vecs(t.slice(0..1).reshape([1, heads * rows, cols]))
+        .chunks(rows)
+        .map(<[Vec<f32>]>::to_vec)
+        .collect()
 }
 
 // --- Embedding layer ---
@@ -358,12 +379,12 @@ impl<B: FusedOps> MultiHeadAttention<B> {
         self.forward_impl(sequence, precision, None)
     }
 
-    /// `attention`, when given, receives batch 0's attention weights `[heads][seq][seq]`.
+    /// `trace`, when given, receives batch 0's `q`, `k`, `v`, `scores` and `attention`.
     fn forward_impl(
         &self,
         sequence: Tensor<B, 3>,
         precision: Precision,
-        attention: Option<&mut Vec<Vec<Vec<f32>>>>,
+        trace: Option<&mut BlockTrace>,
     ) -> Tensor<B, 3> {
         // Input shape is [Batch Size, Sequence Lenght, Input Dimension]
         let [batch_size, seq_len, _d_model] = sequence.dims();
@@ -391,18 +412,18 @@ impl<B: FusedOps> MultiHeadAttention<B> {
 
         // The fused kernel below never materializes the weights, so recompute them from the
         // same queries and keys.
-        if let Some(attention) = attention {
+        if let Some(trace) = trace {
             let q = queries.clone().cast(FloatDType::F32);
             let k = keys.clone().cast(FloatDType::F32);
-            let scores = q.matmul(k.swap_dims(2, 3)) / (self.head_dim as f64).sqrt();
+            let scores =
+                q.clone().matmul(k.clone().swap_dims(2, 3)) / (self.head_dim as f64).sqrt();
             let future = Tensor::<B, 2, Bool>::tril_mask([seq_len, seq_len], 0, &scores.device());
             let scores = scores.mask_fill(future.unsqueeze::<4>(), f32::NEG_INFINITY);
-            let weights = burn::tensor::activation::softmax(scores, 3)
-                .slice(0..1)
-                .squeeze_dim::<3>(0);
-            *attention = (0..self.num_heads)
-                .map(|h| to_vecs(weights.clone().slice(h..h + 1)))
-                .collect();
+            trace.attention = to_heads(burn::tensor::activation::softmax(scores.clone(), 3));
+            trace.scores = to_heads(scores);
+            trace.q = to_heads(q);
+            trace.k = to_heads(k);
+            trace.v = to_heads(values.clone());
         }
 
         // softmax(Q Kᵀ / √head_dim + causal mask) V, as one fused kernel (FlashAttention for
@@ -484,8 +505,7 @@ impl<B: FusedOps> TransformerBlock<B> {
         // Layer normalization
         let x = self.layer_norm1.forward(x);
         // Self attention
-        let attention = trace.as_deref_mut().map(|t| &mut t.attention);
-        let x = self.mha.forward_impl(x, precision, attention);
+        let x = self.mha.forward_impl(x, precision, trace.as_deref_mut());
 
         // let x = self.dropout1.forward(x);
 
@@ -496,11 +516,20 @@ impl<B: FusedOps> TransformerBlock<B> {
 
         // Layer norm
         let x = self.layer_norm2.forward(x);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.mlp_in = to_vecs(x.clone());
+        }
 
         // MLP (the activation runs in the compute dtype, like autocast does)
         let x = linear_lowp(&self.linear1, x, precision);
         let x = self.activation.forward(x);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.mlp_hidden = to_vecs(x.clone());
+        }
         let x = to_f32(linear_lowp(&self.linear2, x, precision), precision);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.mlp_out = to_vecs(x.clone());
+        }
 
         // let x = self.dropout2.forward(x);
 
@@ -710,10 +739,10 @@ mod tests {
             &device,
         );
 
-        let mut attention = Vec::new();
-        let expected = mha.forward_impl(x.clone(), Precision::F32, Some(&mut attention));
+        let mut trace = BlockTrace::default();
+        let expected = mha.forward_impl(x.clone(), Precision::F32, Some(&mut trace));
 
-        let weights: Vec<f32> = attention.into_iter().flatten().flatten().collect();
+        let weights: Vec<f32> = trace.attention.into_iter().flatten().flatten().collect();
         let weights =
             Tensor::<TestBackend, 1>::from_data(weights.as_slice(), &device).reshape([1, 2, 4, 4]);
         let v = mha
@@ -756,5 +785,127 @@ mod tests {
             assert_eq!(head[0].len(), 1);
             assert!((head[0][0] - 1.0).abs() < 1e-6);
         }
+    }
+
+    fn traced_block(ids: &[i64]) -> (GPTModel<TestBackend>, BlockTrace) {
+        let device = Default::default();
+        let model = test_gpt_config(4).init::<TestBackend>(&device);
+        let mut trace = model.forward_traced(indices(ids, &device));
+        (model, trace.blocks.remove(0))
+    }
+
+    fn rows_to_tensor(rows: &[Vec<f32>]) -> Tensor<TestBackend, 3> {
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        Tensor::<TestBackend, 1>::from_data(flat.as_slice(), &Default::default()).reshape([
+            1,
+            rows.len(),
+            rows[0].len(),
+        ])
+    }
+
+    fn assert_rows_close(a: &[Vec<f32>], b: Tensor<TestBackend, 3>) {
+        let b = to_vecs(b);
+        assert_eq!(a.len(), b.len());
+        for (ra, rb) in a.iter().zip(&b) {
+            assert_eq!(ra.len(), rb.len());
+            for (x, y) in ra.iter().zip(rb) {
+                assert!((x - y).abs() < 1e-5, "{x} vs {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn traced_qkv_and_mlp_shapes() {
+        let _rng = crate::torch_rng_lock();
+        let (_, block) = traced_block(&[0, 1, 2]);
+
+        for t in [&block.q, &block.k, &block.v] {
+            assert_eq!(t.len(), 2);
+            assert!(
+                t.iter()
+                    .all(|h| h.len() == 3 && h.iter().all(|r| r.len() == 4))
+            );
+        }
+        assert_eq!(block.scores.len(), 2);
+        for head in &block.scores {
+            assert_eq!(head.len(), 3);
+            for (i, row) in head.iter().enumerate() {
+                assert_eq!(row.len(), 3);
+                for &s in &row[i + 1..] {
+                    assert_eq!(s, f32::NEG_INFINITY);
+                }
+            }
+        }
+        assert_eq!(block.mlp_in.len(), 3);
+        assert!(block.mlp_in.iter().all(|r| r.len() == 8));
+        assert_eq!(block.mlp_hidden.len(), 3);
+        assert!(block.mlp_hidden.iter().all(|r| r.len() == 32));
+        assert_eq!(block.mlp_out.len(), 3);
+        assert!(block.mlp_out.iter().all(|r| r.len() == 8));
+    }
+
+    #[test]
+    fn softmax_of_scores_is_attention() {
+        let _rng = crate::torch_rng_lock();
+        let (_, block) = traced_block(&[0, 1, 2, 3]);
+
+        for (scores, attention) in block.scores.iter().zip(&block.attention) {
+            for (i, (s, a)) in scores.iter().zip(attention).enumerate() {
+                let max = s[..=i].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = s[..=i].iter().map(|x| (x - max).exp()).collect();
+                let sum: f32 = exps.iter().sum();
+                for (j, e) in exps.iter().enumerate() {
+                    let w = e / sum;
+                    assert!((w - a[j]).abs() < 1e-5, "[{i}][{j}] {w} vs {}", a[j]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scores_are_scaled_q_dot_k() {
+        let _rng = crate::torch_rng_lock();
+        let (_, block) = traced_block(&[0, 1, 2, 3]);
+
+        for h in 0..2 {
+            for i in 0..4 {
+                for j in 0..=i {
+                    let dot: f32 = block.q[h][i]
+                        .iter()
+                        .zip(&block.k[h][j])
+                        .map(|(a, b)| a * b)
+                        .sum();
+                    let expected = dot / 4f32.sqrt();
+                    let got = block.scores[h][i][j];
+                    assert!((got - expected).abs() < 1e-5, "{got} vs {expected}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mlp_fields_are_what_the_block_used() {
+        let _rng = crate::torch_rng_lock();
+        let (model, block) = traced_block(&[0, 1, 2, 3]);
+        let layer = &model.transformer_layers[0];
+
+        let mid: Vec<Vec<f32>> = block
+            .residual
+            .iter()
+            .zip(&block.mlp_out)
+            .map(|(r, o)| r.iter().zip(o).map(|(a, b)| a - b).collect())
+            .collect();
+        assert_rows_close(
+            &block.mlp_in,
+            layer.layer_norm2.forward(rows_to_tensor(&mid)),
+        );
+        let hidden = layer
+            .activation
+            .forward(layer.linear1.forward(rows_to_tensor(&block.mlp_in)));
+        assert_rows_close(&block.mlp_hidden, hidden);
+        assert_rows_close(
+            &block.mlp_out,
+            layer.linear2.forward(rows_to_tensor(&block.mlp_hidden)),
+        );
     }
 }

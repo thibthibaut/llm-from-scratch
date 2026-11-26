@@ -235,6 +235,7 @@ pub(crate) mod test_support {
         let block = BlockTrace {
             attention: vec![vec![vec![1.0 / seq as f32; seq]; seq]; 2],
             residual: vec![vec![0.5; 4]; seq],
+            ..Default::default()
         };
         let mut last_logits = vec![0.0; 64];
         last_logits[7] = 10.0;
