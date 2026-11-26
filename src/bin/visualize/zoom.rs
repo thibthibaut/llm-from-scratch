@@ -1,5 +1,6 @@
 use crate::app::App;
 use crate::cache::CacheTag;
+use crate::pca::Pca;
 use crate::ui::{bar, fit, grey, panel, piece, score_grey, window_labels};
 use llm_from_scratch::tokenizer::Tokenizer;
 use ratatui::Frame;
@@ -177,11 +178,75 @@ fn map_window(mut map: Vec<Line<'static>>, rows: usize, layer: usize) -> Vec<Lin
     map
 }
 
+/// Black for `a ≤ 0`, white at the token's `max`, linear between.
+pub fn neuron_grey(a: f32, max: f32) -> u8 {
+    if a <= 0.0 || max <= 0.0 {
+        return 0;
+    }
+    (255.0 * a / max).round().clamp(0.0, 255.0) as u8
+}
+
+/// Neurons per grid row; each `▀` cell holds two grid rows (top = fg, bottom = bg).
+const GRID_COLS: usize = 64;
+
+pub(crate) fn mlp_zoom_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca, area: Rect) {
+    let input = app.model_input();
+    let pos = app.zoom_pos;
+    let label = input.get(pos).map_or(String::new(), |&t| piece(app, t));
+    let title = format!(" MLP · layer {} · token \"{label}\" ", app.layer);
+    let inner = panel(frame, area, title, Style::default());
+    let Some(b) = (app.trace.as_ref())
+        .zip(app.layer.checked_sub(1))
+        .and_then(|(t, l)| t.blocks.get(l))
+    else {
+        return;
+    };
+    // after a commit the input has grown but the trace is still the old pass
+    if b.mlp_in.len() != input.len() || pos >= input.len() {
+        return;
+    }
+    let (hidden, pad) = (&b.mlp_hidden[pos], " ".repeat(ZOOM_LABEL));
+    let row = |kind: &str, v: &[f32], note: &str| {
+        let mut r = vec![Span::raw(fit(kind, ZOOM_LABEL))];
+        r.extend(cells(v, max_abs(v)));
+        r.push(Span::raw(format!("  {note}")));
+        Line::from(r)
+    };
+    let mut lines = vec![row(
+        "in",
+        &pca.project_direction(&b.mlp_in[pos]),
+        "after LayerNorm",
+    )];
+    let max = hidden.iter().fold(0.0f32, |m, &x| m.max(x));
+    let at = |i: usize| neuron_grey(hidden.get(i).copied().unwrap_or(0.0), max);
+    for r in 0..hidden.len().div_ceil(2 * GRID_COLS) {
+        let mut cells = vec![Span::raw(if r == 0 {
+            fit("hidden", ZOOM_LABEL)
+        } else {
+            pad.clone()
+        })];
+        for c in 0..GRID_COLS {
+            let (top, bottom) = (at(2 * r * GRID_COLS + c), at((2 * r + 1) * GRID_COLS + c));
+            let style = Style::default()
+                .fg(Color::Rgb(top, top, top))
+                .bg(Color::Rgb(bottom, bottom, bottom));
+            cells.push(Span::styled("▀", style));
+        }
+        lines.push(Line::from(cells));
+    }
+    lines.push(row(
+        "out",
+        &pca.project_direction(&b.mlp_out[pos]),
+        "added to residual",
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Stage, Zoom};
     use crate::app::test_support::fake_trace;
+    use crate::app::{Stage, Zoom};
     use crate::ui::tests::{lines, press, render, running, zoomed};
     use ratatui::crossterm::event::KeyCode;
 
@@ -273,5 +338,21 @@ mod tests {
             press(&mut a, KeyCode::Enter);
             assert!(render(&a, w, h).contains("q ⊙ k") || h < 24);
         }
+    }
+
+    #[test]
+    fn neuron_grey_maps() {
+        assert_eq!(neuron_grey(-0.1, 2.0), 0);
+        assert_eq!(neuron_grey(2.0, 2.0), 255);
+        assert_eq!(neuron_grey(1.0, 0.0), 0);
+    }
+
+    #[test]
+    fn mlp_zoom_shows_in_hidden_out() {
+        let text = render(&zoomed("abc", Zoom::Mlp), 120, 40);
+        assert!(text.contains("after LayerNorm"));
+        assert!(text.contains("added to residual"));
+        assert!(text.contains("MLP · layer 2"));
+        assert!(text.matches('▀').count() >= 24);
     }
 }

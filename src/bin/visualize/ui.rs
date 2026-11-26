@@ -91,18 +91,16 @@ pub fn draw<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca) {
         attention_panel(frame, app, att);
         output_panel(frame, app, output);
     } else {
-        zoom_panel(frame, app, middle.union(output));
+        zoom_panel(frame, app, pca, middle.union(output));
     }
     footer_bar(frame, app, footer);
 }
 
 /// The zoom takes the middle band and the output rows.
-fn zoom_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
+fn zoom_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca, area: Rect) {
     match app.zoom {
         Zoom::Head => zoom::head_zoom_panel(frame, app, area),
-        _ => {
-            panel(frame, area, " MLP zoom ".into(), Style::default());
-        }
+        _ => zoom::mlp_zoom_panel(frame, app, pca, area),
     }
 }
 /// Renders a titled block and returns its inner area.

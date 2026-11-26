@@ -30,6 +30,14 @@ impl Pca {
         }
     }
 
+    /// basis · v, with no mean subtraction: for vectors that are not positions.
+    pub fn project_direction(&self, v: &[f32]) -> Vec<f32> {
+        self.basis
+            .iter()
+            .map(|b| b.iter().zip(v).map(|(b, v)| b * v).sum())
+            .collect()
+    }
+
     /// (v − mean) · basisᵀ → k values.
     pub fn project(&self, v: &[f32]) -> Vec<f32> {
         self.basis
@@ -48,7 +56,7 @@ impl Pca {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
 
     #[test]
     fn basis_is_orthonormal() {
@@ -91,5 +99,20 @@ mod tests {
         let out = p.project(&means);
         assert_eq!(out.len(), 4);
         assert!(out.iter().all(|x| x.abs() < 1e-4));
+    }
+
+    #[test]
+    fn project_direction_skips_mean() {
+        let data: Vec<f32> = (0..40).map(|i| 5.0 + ((i * 7) % 11) as f32).collect();
+        let p = Pca::fit(&data, 10, 4, 2);
+        let v = [1.0, -2.0, 0.5, 3.0];
+        let (d, c) = (p.project_direction(&v), p.project(&v));
+        for (k, b) in p.basis.iter().enumerate() {
+            let want: f32 = b.iter().zip(&v).map(|(b, v)| b * v).sum();
+            let mean_part: f32 = b.iter().zip(&p.mean).map(|(b, m)| b * m).sum();
+            assert!((d[k] - want).abs() < 1e-5);
+            assert!(mean_part.abs() > 0.1);
+            assert!((d[k] - c[k] - mean_part).abs() < 1e-4);
+        }
     }
 }

@@ -202,7 +202,8 @@ cargo run --release --bin visualize -- --config-path artifacts/config.json --mod
 
 `--device` defaults to `cpu`. Panels: prompt, token chips, embeddings (the last 8 tokens, each as
 16 PCA components of the token-embedding table) and attention (the last 8×8 window) at the chosen
-layer, the next-token distribution, and the sampler's filtered distribution.
+layer, the next-token distribution, and the sampler's filtered distribution. The minimum
+terminal size is 120×40.
 
 Two modes:
 
@@ -219,8 +220,18 @@ Two modes:
   | t / T | temperature − / + 0.1 |
   | k / K | top-k down / up (off, 1, 5, 10, 15, …; starts at 10) |
   | p / P | top-p − / + 0.05 (off at 1) |
-  | Esc | back to EDIT, text kept |
+  | z | head zoom: q·k, softmax and weighted v for one head, plus the KV-cache map |
+  | m | MLP zoom: the MLP input, its 3,072 GELU neurons, its output |
+  | s | scores / weights in the attention panel |
+  | ↑ / ↓ in a zoom | select the token |
+  | [ / ] in a zoom | previous / next layer |
+  | Esc | close the zoom, or back to EDIT (text kept) |
   | Ctrl+C | quit |
+
+In the KV-cache map, `read` / `write` / `recomputed` come from comparing each pass's K and V with
+the previous pass's, since the model itself always recomputes everything: `read` means the value
+is unchanged, `write` that the token is new, `recomputed` that an old token's value changed
+(for example after the window slid or the prompt was edited).
 
 The sampler starts at T=1, top-k 10, top-p off: at T=1 this small model spreads most of its
 probability over the long tail (63% outside the top 10 after "The cat sat on the"), so an
