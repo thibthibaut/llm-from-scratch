@@ -221,7 +221,7 @@ fn embeddings_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, pca: &Pca, ar
                 .saturating_sub(LABEL)
                 .checked_div(proj.len())
                 .unwrap_or(1)
-                .clamp(1, 2);
+                .max(1);
             let mut spans = vec![Span::raw(fit(&label, LABEL))];
             spans.extend(
                 proj.iter()
@@ -254,36 +254,42 @@ fn attention_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
     else {
         return;
     };
-    let start = weights.len().saturating_sub(app.window);
-    let labels = window_labels(app, weights.len());
+    let len = weights.len();
+    // Query rows are the token window; key columns reach back as far as the width allows
+    // (3 columns per key), since a query attends to every earlier token.
+    let start = len.saturating_sub(app.window);
+    let free = (inner.width as usize).saturating_sub(LABEL);
+    let keys = (free / 3).clamp(len - start, len);
+    let kstart = len - keys;
+    let input = app.model_input();
+    let label = |p: usize| {
+        input
+            .get(input.len().saturating_sub(len) + p)
+            .map_or(String::new(), |&t| piece(app, t))
+    };
     let scores = app
         .show_scores
         .then(|| &trace.blocks[app.layer - 1].scores[app.head]);
-    // scale by the visible window's largest finite |score|
+    // scale by the visible cells' largest finite |score|
     let max = scores.map_or(0.0, |sc| {
         sc[start..]
             .iter()
-            .flat_map(|r| &r[start..])
+            .flat_map(|r| &r[kstart..])
             .filter(|v| v.is_finite())
             .fold(0.0f32, |m, v| m.max(v.abs()))
     });
     // Cells adapt to the panel: up to 3 shaded cols + 1 separator, down to 1 col.
-    let n = weights.len().min(app.window);
-    let step = (inner.width as usize)
-        .saturating_sub(LABEL)
-        .checked_div(n)
-        .unwrap_or(1)
-        .clamp(1, 4);
+    let step = free.checked_div(keys).unwrap_or(1).clamp(1, 4);
     let (cell, sep) = if step > 1 { (step - 1, " ") } else { (1, "") };
     let mut header = vec![Span::raw(" ".repeat(LABEL))];
-    header.extend(labels.iter().map(|l| Span::raw(fit(l, cell) + sep)));
+    header.extend((kstart..len).map(|p| Span::raw(fit(&label(p), cell) + sep)));
     let mut lines = vec![Line::from(header)];
-    for (i, (row, label)) in weights[start..].iter().zip(&labels).enumerate() {
-        let mut spans = vec![Span::raw(fit(label, LABEL))];
-        for (j, &w) in row[start..].iter().enumerate() {
+    for (q, row) in weights.iter().enumerate().skip(start) {
+        let mut spans = vec![Span::raw(fit(&label(q), LABEL))];
+        for (k, &w) in row.iter().enumerate().skip(kstart) {
             let g = match scores {
-                Some(_) if j > i => 0, // masked
-                Some(sc) => score_grey(sc[start + i][start + j], max),
+                Some(_) if k > q => 0, // masked
+                Some(sc) => score_grey(sc[q][k], max),
                 None => attention_grey(w),
             };
             spans.push(Span::styled(" ".repeat(cell), grey(g)));
@@ -602,18 +608,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn attention_shows_more_keys_than_rows() {
+        let mut a = running("abcdefghijklmnopqrst"); // 20 tokens
+        press(&mut a, KeyCode::Enter); // Block(1)
+        a.set_window(8);
+        // 120 wide: (58 inner - 8 label) / 3 = 16 key columns for 8 query rows.
+        // CharTokenizer shows 'e' as '%' and 'd' as '$'.
+        let h = attention_header(&render(&a, 120, 40));
+        assert!(h.contains('%') && !h.contains('$'), "{h:?}");
+    }
+
+    #[test]
+    fn embedding_cells_fill_width() {
+        let a = running("abc");
+        let mut t = Terminal::new(TestBackend::new(200, 60)).unwrap();
+        t.draw(|f| draw(f, &a, &pca())).unwrap();
+        let buf = t.backend().buffer();
+        let y = (0..60)
+            .find(|&y| {
+                (0..100)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("Embeddings")
+            })
+            .unwrap()
+            + 1;
+        let shaded = (0..100u16)
+            .filter(|&x| matches!(buf[(x, y)].bg, Color::Rgb(..)))
+            .count();
+        assert!(shaded >= 16 * 5, "{shaded} shaded cells"); // (98 inner - 8 label) / 16 = 5
+    }
+
+    #[test]
     fn panels_follow_window() {
         let mut a = running("abcdefghijkl"); // 12 tokens
         press(&mut a, KeyCode::Enter); // Block(1)
         a.set_window(window_for(Rect::new(0, 0, 200, 60)));
         // CharTokenizer maps 'a' to Token(33), shown as '!'
+        let embedding_rows = |text: String| -> String {
+            let rows: Vec<String> = text
+                .chars()
+                .collect::<Vec<_>>()
+                .chunks(120)
+                .map(|r| r[..60].iter().collect())
+                .collect();
+            let t = rows.iter().position(|r| r.contains("Embeddings")).unwrap();
+            rows[t + 1..].concat()
+        };
         assert!(
-            attention_header(&render(&a, 120, 40)).contains('!'),
+            embedding_rows(render(&a, 120, 40)).contains('!'),
             "all 12 shown"
         );
         a.set_window(8);
         assert!(
-            !attention_header(&render(&a, 120, 40)).contains('!'),
+            !embedding_rows(render(&a, 120, 40)).contains('!'),
             "first 4 hidden"
         );
     }

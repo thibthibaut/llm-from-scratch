@@ -201,7 +201,8 @@ cargo run --release --bin visualize -- --config-path artifacts/config.json --mod
 ```
 
 `--device` defaults to `cpu`. Panels: prompt, token chips, embeddings (the last N tokens, each as
-16 PCA components of the token-embedding table) and attention (the last N×N window) at the chosen
+16 PCA components of the token-embedding table) and attention (the last N tokens as query rows,
+and as many earlier key columns as the width fits) at the chosen
 layer, and one "Next token" panel (the model's distribution and the sampler's filtered one). N is
 as many tokens as the terminal fits and follows resizes: 10 at the minimum size of 120×40, 20 at
 200×60.
