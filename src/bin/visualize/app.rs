@@ -145,7 +145,15 @@ impl<T: Tokenizer> App<T> {
         if self.is_editing() {
             return self.edit_key(key.code);
         }
-        match key.code {
+        // vim keys mirror the arrows
+        let code = match key.code {
+            KeyCode::Char('h') => KeyCode::Left,
+            KeyCode::Char('j') => KeyCode::Down,
+            KeyCode::Char('k') => KeyCode::Up,
+            KeyCode::Char('l') => KeyCode::Right,
+            c => c,
+        };
+        match code {
             KeyCode::Enter => return self.advance(),
             KeyCode::Char(' ') if self.stage != Stage::Drawn => self.go(Stage::Sampler),
             KeyCode::Char('z') => self.toggle_zoom(Zoom::Head),
@@ -235,12 +243,12 @@ impl<T: Tokenizer> App<T> {
         match c {
             't' => self.temperature = round_to(self.temperature - 0.1, 10.0).max(0.1),
             'T' => self.temperature = round_to(self.temperature + 0.1, 10.0).min(3.0),
-            'k' | 'K' => {
+            'n' | 'N' => {
                 // None, 1, 5, 10, 15, ...
                 self.top_k = match (c, self.top_k) {
-                    ('k', None | Some(1)) => None,
-                    ('k', Some(5)) => Some(1),
-                    ('k', Some(k)) => Some(k - 5),
+                    ('n', None | Some(1)) => None,
+                    ('n', Some(5)) => Some(1),
+                    ('n', Some(k)) => Some(k - 5),
                     (_, None) => Some(1),
                     (_, Some(1)) => Some(5),
                     (_, Some(k)) => Some(k + 5),
@@ -507,11 +515,11 @@ mod tests {
         assert_eq!(a.temperature, 3.0);
         a.top_k = None;
         for (c, want) in [
-            ('K', Some(1)),
-            ('K', Some(5)),
-            ('k', Some(1)),
-            ('k', None),
-            ('k', None),
+            ('N', Some(1)),
+            ('N', Some(5)),
+            ('n', Some(1)),
+            ('n', None),
+            ('n', None),
         ] {
             press(&mut a, c, 1);
             assert_eq!(a.top_k, want);
@@ -528,7 +536,7 @@ mod tests {
         a.top_k = None;
         let mut up = vec![];
         for _ in 0..20 {
-            a.on_key(key(KeyCode::Char('K')));
+            a.on_key(key(KeyCode::Char('N')));
             up.push(a.top_k);
         }
         let grid: Vec<Option<usize>> = [1, 5]
@@ -538,7 +546,7 @@ mod tests {
             .collect();
         assert_eq!(up, grid);
         for want in grid.iter().rev().skip(1).chain([&None]) {
-            a.on_key(key(KeyCode::Char('k')));
+            a.on_key(key(KeyCode::Char('n')));
             assert_eq!(&a.top_k, want);
         }
     }
@@ -570,10 +578,33 @@ mod tests {
     }
 
     #[test]
+    fn hjkl_mirror_arrows() {
+        let mut a = at_sampler(); // reached layer 2
+        for (c, layer, head) in [('j', 1, 0), ('k', 2, 0), ('l', 2, 1), ('h', 2, 0)] {
+            a.on_key(key(KeyCode::Char(c)));
+            assert_eq!((a.layer, a.head), (layer, head), "after {c}");
+        }
+        assert_eq!(a.top_k, Some(10), "k no longer touches top-k");
+        a.on_key(key(KeyCode::Char('z')));
+        let last = a.zoom_pos;
+        a.on_key(key(KeyCode::Char('k')));
+        assert_eq!(a.zoom_pos, last - 1);
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.zoom_pos, last);
+    }
+
+    #[test]
+    fn hjkl_are_text_in_edit_mode() {
+        let mut a = app();
+        type_str(&mut a, "hjkl");
+        assert_eq!(a.text, "hjkl");
+    }
+
+    #[test]
     fn greedy_draw_with_top_k_1() {
         let mut a = at_sampler();
-        a.on_key(key(KeyCode::Char('k')));
-        a.on_key(key(KeyCode::Char('k')));
+        a.on_key(key(KeyCode::Char('n')));
+        a.on_key(key(KeyCode::Char('n')));
         assert_eq!(a.top_k, Some(1));
         enter(&mut a);
         assert_eq!(a.drawn, Some(7));

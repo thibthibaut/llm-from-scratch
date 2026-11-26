@@ -215,15 +215,15 @@ Two modes:
   |-----|--------|
   | Enter | next stage |
   | Space | jump to the sampler |
-  | ↑ / ↓ | layer (up to the block reached) |
-  | ← / → | head |
+  | ↑ / ↓ or k / j | layer (up to the block reached) |
+  | ← / → or h / l | head |
   | t / T | temperature − / + 0.1 |
-  | k / K | top-k down / up (off, 1, 5, 10, 15, …; starts at 10) |
+  | n / N | top-k down / up (off, 1, 5, 10, 15, …; starts at 10) |
   | p / P | top-p − / + 0.05 (off at 1) |
   | z | head zoom: q·k, softmax and weighted v for one head, plus the KV-cache map |
   | m | MLP zoom: the MLP input, its 3,072 GELU neurons, its output |
   | s | scores / weights in the attention panel |
-  | ↑ / ↓ in a zoom | select the token |
+  | ↑ / ↓ or k / j in a zoom | select the token |
   | [ / ] in a zoom | previous / next layer |
   | Esc | close the zoom, or back to EDIT (text kept) |
   | Ctrl+C | quit |
@@ -236,7 +236,7 @@ its prefix matched; not expected, shown if it ever happens.
 
 The sampler starts at T=1, top-k 10, top-p off: at T=1 this small model spreads most of its
 probability over the long tail (63% outside the top 10 after "The cat sat on the"), so an
-unfiltered draw usually lands on a token that looks improbable. Press `k` until top-k is off
+unfiltered draw usually lands on a token that looks improbable. Press `n` until top-k is off
 to sample the raw distribution.
 
 The prompt is capped to its last 256 tokens for the model. Colors need a true-colour terminal.

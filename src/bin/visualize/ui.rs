@@ -353,8 +353,8 @@ fn output_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
 }
 
 fn footer_bar<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
-    let text = if app.is_editing() {
-        "type to edit · Enter run · Ctrl+C quit".to_string()
+    let (stage, text) = if app.is_editing() {
+        (None, "type to edit · Enter run · Ctrl+C quit".to_string())
     } else {
         let stage = match app.stage {
             Stage::Block(n) => {
@@ -369,22 +369,47 @@ fn footer_bar<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
             Stage::Embedding | Stage::Editing => "embedding".into(),
         };
         let keys = match app.zoom {
-            Zoom::Off => "Space sampler · ↑↓ layer · ←→ head · z head · m mlp · s scores",
-            Zoom::Head => "↑↓ query · ←→ head · [ ] layer · m mlp · z/Esc close",
-            Zoom::Mlp => "↑↓ token · [ ] layer · z head · m/Esc close",
+            Zoom::Off => "Space sampler · ↑↓/jk layer · ←→/hl head · z head · m mlp · s scores",
+            Zoom::Head => "↑↓/jk query · ←→/hl head · [ ] layer · m mlp · z/Esc close",
+            Zoom::Mlp => "↑↓/jk token · [ ] layer · z head · m/Esc close",
         };
         let tail = if app.zoom == Zoom::Off {
             " · Esc edit"
         } else {
             ""
         };
-        format!(
-            "{stage} · Enter next · {keys} · t/T temp · k/K top-k · p/P top-p{tail} · Ctrl+C quit"
+        (
+            Some(stage),
+            format!("Enter next · {keys} · t/T temp · n/N top-k · p/P top-p{tail} · Ctrl+C quit"),
         )
     };
-    let footer = Paragraph::new(text)
-        .style(Style::default().fg(Color::DarkGray))
-        .wrap(Wrap { trim: true });
+    let key = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans = Vec::new();
+    if let Some(stage) = stage {
+        spans.push(Span::styled(
+            stage,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" · ", dim));
+    }
+    // each hint is "<keys> <action>": keys bold yellow, action white
+    for (i, hint) in text.split(" · ").enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        let (keys, action) = hint.split_once(' ').unwrap_or((hint, ""));
+        spans.push(Span::styled(keys.to_string(), key));
+        spans.push(Span::styled(
+            format!(" {action}"),
+            Style::default().fg(Color::White),
+        ));
+    }
+    let footer = Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true });
     frame.render_widget(footer, area);
 }
 
@@ -583,8 +608,8 @@ pub(crate) mod tests {
         while a.stage != Stage::Output {
             press(&mut a, KeyCode::Enter);
         }
-        press(&mut a, KeyCode::Char('k'));
-        press(&mut a, KeyCode::Char('k'));
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Char('n'));
         assert_eq!(a.top_k, Some(1));
         assert!(render(&a, 120, 40).contains("✗ cut"));
     }
@@ -596,6 +621,20 @@ pub(crate) mod tests {
         assert!(render(&a, 120, 40).contains("weights"));
         press(&mut a, KeyCode::Char('s'));
         assert!(render(&a, 120, 40).contains("scores"));
+    }
+
+    #[test]
+    fn footer_keys_are_highlighted() {
+        let mut a = running("abc");
+        press(&mut a, KeyCode::Enter);
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| draw(f, &a, &pca())).unwrap();
+        let buf = t.backend().buffer();
+        let row: String = (0..120).map(|x| buf[(x, 38)].symbol()).collect();
+        let x = row.find("Enter").expect("footer row shows Enter") as u16;
+        assert_eq!(buf[(x, 38)].fg, Color::Yellow);
+        assert!(buf[(x, 38)].modifier.contains(Modifier::BOLD));
+        assert!(row.contains("n/N top-k") && row.contains("jk layer"));
     }
 
     #[test]
@@ -621,8 +660,8 @@ pub(crate) mod tests {
     fn cut_marker_shown() {
         let mut a = running("abc");
         press(&mut a, KeyCode::Char(' '));
-        press(&mut a, KeyCode::Char('k'));
-        press(&mut a, KeyCode::Char('k'));
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Char('n'));
         assert_eq!(a.top_k, Some(1));
         assert!(render(&a, 120, 40).contains('✗'));
     }
