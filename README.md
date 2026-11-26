@@ -202,7 +202,7 @@ cargo run --release --bin visualize -- --config-path artifacts/config.json --mod
 
 `--device` defaults to `cpu`. Panels: prompt, token chips, embeddings (the last 8 tokens, each as
 16 PCA components of the token-embedding table) and attention (the last 8×8 window) at the chosen
-layer, the next-token distribution, and the sampler's filtered distribution. The minimum
+layer, and one "Next token" panel (the model's distribution and the sampler's filtered one). The minimum
 terminal size is 120×40.
 
 Two modes:
@@ -230,8 +230,9 @@ Two modes:
 
 In the KV-cache map, `read` / `write` / `recomputed` come from comparing each pass's K and V with
 the previous pass's, since the model itself always recomputes everything: `read` means the value
-is unchanged, `write` that the token is new, `recomputed` that an old token's value changed
-(for example after the window slid or the prompt was edited).
+is unchanged, `write` that it is new. A slid window shows every row as `write`; an edit shows `read`
+on the shared prefix, `write` after. `recomputed` means an earlier token's K/V changed although
+its prefix matched; not expected, shown if it ever happens.
 
 The sampler starts at T=1, top-k 10, top-p off: at T=1 this small model spreads most of its
 probability over the long tail (63% outside the top 10 after "The cat sat on the"), so an

@@ -34,10 +34,10 @@ fn tag_span(tag: Option<CacheTag>) -> Span<'static> {
     }
 }
 
-/// `Σ weight × v` over keys `start..=query` (the shown rows), from recorded values.
-fn head_out(weights: &[f32], v: &[Vec<f32>], start: usize, query: usize) -> Vec<f32> {
+/// `Σ weight × v` over all keys `0..=query`, from recorded values.
+fn head_out(weights: &[f32], v: &[Vec<f32>], query: usize) -> Vec<f32> {
     let mut out = vec![0.0; v.get(query).map_or(0, |r| r.len())];
-    for j in start..=query {
+    for j in 0..=query {
         for (o, x) in out.iter_mut().zip(&v[j]) {
             *o += weights[j] * x;
         }
@@ -87,6 +87,20 @@ pub(crate) fn head_zoom_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, are
         .map(|j| q[query].iter().zip(&k[j]).map(|(a, b)| a * b).collect())
         .collect();
     let qk_max = qk.iter().fold(0.0f32, |m, r| m.max(max_abs(r)));
+    // keys before the display window, summarised as one weight
+    let earlier = || {
+        let mut row = vec![Span::raw(fit(&format!("…{start} earlier"), ZOOM_LABEL))];
+        row.push(Span::raw(" ".repeat(col + 2 + 7)));
+        row.extend(bar(
+            weights[..start].iter().sum(),
+            BAR,
+            Style::default().fg(Color::Cyan),
+        ));
+        row
+    };
+    if start > 0 {
+        lines.push(Line::from(earlier()));
+    }
     for (j, prod) in (start..=query).zip(&qk) {
         let mut row = vec![head("k", j)];
         row.extend(cells(prod, qk_max));
@@ -99,6 +113,15 @@ pub(crate) fn head_zoom_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, are
     }
     // v cells start after the bar column + " × "; pad so tags line up with the key rows
     let v_pad = " ".repeat(col + 2 + 7 + BAR + 5 + 2 - (BAR + 5 + 3 + d));
+    if start > 0 {
+        let mut row = vec![Span::raw(fit(&format!("…{start} earlier"), ZOOM_LABEL))];
+        row.extend(bar(
+            weights[..start].iter().sum(),
+            BAR,
+            Style::default().fg(Color::Cyan),
+        ));
+        lines.push(Line::from(row));
+    }
     for j in start..=query {
         let mut row = vec![head("v", j)];
         row.extend(bar(weights[j], BAR, Style::default().fg(Color::Cyan)));
@@ -108,7 +131,7 @@ pub(crate) fn head_zoom_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, are
         row.push(tag_span(tag(j)));
         lines.push(Line::from(row));
     }
-    let out = head_out(weights, v, start, query);
+    let out = head_out(weights, v, query);
     let mut row = vec![Span::raw(fit("= out", ZOOM_LABEL + BAR + 5 + 3))];
     row.extend(cells(&out, max_abs(&out)));
     row.push(Span::raw("  head output (before W_O)"));
@@ -262,7 +285,7 @@ mod tests {
         assert!(text.contains("write"));
         // out = Σ_j attention[0][2][j] · v[0][j], block 2, rebuilt from fake_trace's closed form
         let blk = &a.trace.as_ref().unwrap().blocks[1];
-        let out = head_out(&blk.attention[0][2], &blk.v[0], 0, 2);
+        let out = head_out(&blk.attention[0][2], &blk.v[0], 2);
         assert_eq!(out.len(), 3);
         for (d, o) in out.iter().enumerate() {
             // v = 2 + (1000 + 10p + d)·0.01, weights 1/3 over p = 0..=2
@@ -338,6 +361,24 @@ mod tests {
             press(&mut a, KeyCode::Enter);
             assert!(render(&a, w, h).contains("q ⊙ k") || h < 24);
         }
+    }
+
+    #[test]
+    fn head_out_includes_keys_before_window() {
+        let w = [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.25];
+        let v: Vec<Vec<f32>> = (0..10).map(|p| vec![p as f32, 1.0]).collect();
+        let out = head_out(&w, &v, 9);
+        // the window-only sum would give 0.5 in dim 1
+        assert_eq!(out, vec![4.25, 1.0]);
+    }
+
+    #[test]
+    fn head_zoom_shows_earlier_keys_row() {
+        let text = render(&zoomed("abcdefghij", Zoom::Head), 120, 40);
+        assert!(text.contains("2 earlier"), "{text}");
+        assert!(text.contains("0.20"), "{text}");
+        let text = render(&zoomed("abc", Zoom::Head), 120, 40);
+        assert!(!text.contains("earlier"));
     }
 
     #[test]

@@ -175,6 +175,7 @@ impl<T: Tokenizer> App<T> {
             }
             KeyCode::Up => self.layer = (self.layer + 1).min(self.reached_layer()),
             KeyCode::Down => self.layer = self.layer.saturating_sub(1),
+            KeyCode::Left | KeyCode::Right if self.zoom == Zoom::Mlp => {}
             KeyCode::Left => self.head = self.head.saturating_sub(1),
             KeyCode::Right => self.head = (self.head + 1).min(self.num_heads.saturating_sub(1)),
             KeyCode::Char(c) if matches!(self.stage, Stage::Output | Stage::Sampler) => {
@@ -462,6 +463,21 @@ mod tests {
             a.on_key(key(KeyCode::Down));
         }
         assert_eq!(a.layer, 0);
+    }
+
+    #[test]
+    fn arrows_do_not_change_head_in_mlp_zoom() {
+        let mut a = at_embedding();
+        a.on_key(key(KeyCode::Enter));
+        a.on_key(key(KeyCode::Char('m')));
+        assert_eq!(a.zoom, Zoom::Mlp);
+        a.on_key(key(KeyCode::Right));
+        assert_eq!(a.head, 0);
+        a.on_key(key(KeyCode::Left));
+        assert_eq!(a.head, 0);
+        a.on_key(key(KeyCode::Char('m')));
+        a.on_key(key(KeyCode::Right));
+        assert_eq!(a.head, 1);
     }
 
     #[test]
