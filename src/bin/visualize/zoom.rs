@@ -1,0 +1,277 @@
+use crate::app::App;
+use crate::cache::CacheTag;
+use crate::ui::{bar, fit, grey, panel, piece, score_grey, window_labels};
+use llm_from_scratch::tokenizer::Tokenizer;
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+
+/// Kind marker + token label, the left column of every zoom row.
+const ZOOM_LABEL: usize = 10;
+/// Weight bar cells; with " 0.00" the bar column is `BAR + 5` wide.
+const BAR: usize = 6;
+
+/// One diverging-grey cell per element, scaled by `max_abs`.
+fn cells(v: &[f32], max_abs: f32) -> Vec<Span<'static>> {
+    v.iter()
+        .map(|&x| Span::styled(" ", grey(score_grey(x, max_abs))))
+        .collect()
+}
+
+fn max_abs(v: &[f32]) -> f32 {
+    v.iter().fold(0.0f32, |m, x| m.max(x.abs()))
+}
+
+fn tag_span(tag: Option<CacheTag>) -> Span<'static> {
+    match tag {
+        Some(CacheTag::Read) => Span::styled("read", Style::default().fg(Color::DarkGray)),
+        Some(CacheTag::Write) => Span::styled("write", Style::default().fg(Color::White)),
+        Some(CacheTag::Recomputed) => Span::styled("recomputed", Style::default().fg(Color::Red)),
+        None => Span::raw(""),
+    }
+}
+
+/// `Σ weight × v` over keys `start..=query` (the shown rows), from recorded values.
+fn head_out(weights: &[f32], v: &[Vec<f32>], start: usize, query: usize) -> Vec<f32> {
+    let mut out = vec![0.0; v.get(query).map_or(0, |r| r.len())];
+    for j in start..=query {
+        for (o, x) in out.iter_mut().zip(&v[j]) {
+            *o += weights[j] * x;
+        }
+    }
+    out
+}
+
+pub(crate) fn head_zoom_panel<T: Tokenizer>(frame: &mut Frame, app: &App<T>, area: Rect) {
+    let input = app.model_input();
+    let (start, query) = (app.window_start(), app.zoom_pos);
+    let label = |p: usize| input.get(p).map_or(String::new(), |&t| piece(app, t));
+    let title = format!(
+        " Head {}·{} · query \"{}\" ",
+        app.layer,
+        app.head + 1,
+        label(query)
+    );
+    let inner = panel(frame, area, title, Style::default());
+    let Some(trace) = &app.trace else { return };
+    let Some(b) = app.layer.checked_sub(1).and_then(|l| trace.blocks.get(l)) else {
+        return;
+    };
+    // after a commit the input has grown but the trace is still the old pass
+    if b.q.get(app.head).is_none_or(|q| q.len() != input.len()) || query >= input.len() {
+        return;
+    }
+    let (q, k, v) = (&b.q[app.head], &b.k[app.head], &b.v[app.head]);
+    let (scores, weights) = (&b.scores[app.head][query], &b.attention[app.head][query]);
+    let tags = app.cache.as_ref().and_then(|c| c.get(app.layer - 1));
+    let tag = |p: usize| tags.and_then(|t| t.get(p).copied());
+    let head = |kind: &str, p: usize| Span::raw(fit(&format!("{kind}  {}", label(p)), ZOOM_LABEL));
+    let d = q[query].len();
+    let col = d.max("q ⊙ k".chars().count()); // q ⊙ k column, at least its heading
+
+    let mut lines = vec![];
+    let mut row = vec![head("q", query)];
+    row.extend(cells(&q[query], max_abs(&q[query])));
+    lines.push(Line::from(row));
+    lines.push(Line::raw(format!(
+        "{}{}  {}{}",
+        " ".repeat(ZOOM_LABEL),
+        fit("q ⊙ k", col),
+        fit("score", 7),
+        "softmax"
+    )));
+    let qk: Vec<Vec<f32>> = (start..=query)
+        .map(|j| q[query].iter().zip(&k[j]).map(|(a, b)| a * b).collect())
+        .collect();
+    let qk_max = qk.iter().fold(0.0f32, |m, r| m.max(max_abs(r)));
+    for (j, prod) in (start..=query).zip(&qk) {
+        let mut row = vec![head("k", j)];
+        row.extend(cells(prod, qk_max));
+        row.push(Span::raw(" ".repeat(col - d)));
+        row.push(Span::raw(format!("  {:<7}", format!("{:+.1}", scores[j]))));
+        row.extend(bar(weights[j], BAR, Style::default().fg(Color::Cyan)));
+        row.push(Span::raw("  "));
+        row.push(tag_span(tag(j)));
+        lines.push(Line::from(row));
+    }
+    // v cells start after the bar column + " × "; pad so tags line up with the key rows
+    let v_pad = " ".repeat(col + 2 + 7 + BAR + 5 + 2 - (BAR + 5 + 3 + d));
+    for j in start..=query {
+        let mut row = vec![head("v", j)];
+        row.extend(bar(weights[j], BAR, Style::default().fg(Color::Cyan)));
+        row.push(Span::raw(" × "));
+        row.extend(cells(&v[j], max_abs(&v[j])));
+        row.push(Span::raw(v_pad.clone()));
+        row.push(tag_span(tag(j)));
+        lines.push(Line::from(row));
+    }
+    let out = head_out(weights, v, start, query);
+    let mut row = vec![Span::raw(fit("= out", ZOOM_LABEL + BAR + 5 + 3))];
+    row.extend(cells(&out, max_abs(&out)));
+    row.push(Span::raw("  head output (before W_O)"));
+    lines.push(Line::from(row));
+
+    let map = cache_map(app, app.cache.as_deref());
+    // the map keeps at least its header + the selected layer's row
+    let map_h = (map.len() as u16).min(inner.height.saturating_sub(lines.len() as u16).max(2));
+    // the map follows the pipeline rows directly
+    let top_h = (lines.len() as u16).min(inner.height.saturating_sub(map_h));
+    let top = Rect {
+        height: top_h,
+        ..inner
+    };
+    let bottom = Rect {
+        y: inner.y + top_h,
+        height: map_h.min(inner.height),
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(lines), top);
+    let rows = (map_h as usize).saturating_sub(1);
+    frame.render_widget(Paragraph::new(map_window(map, rows, app.layer)), bottom);
+}
+
+/// Header + one row per reached layer: dim `Read`, bright `Write`, red `Recomputed`.
+fn cache_map<T: Tokenizer>(app: &App<T>, cache: Option<&[Vec<CacheTag>]>) -> Vec<Line<'static>> {
+    let Some(cache) = cache else { return vec![] };
+    let n = app.model_input().len();
+    let mut header = vec![Span::raw(fit("KV cache", ZOOM_LABEL))];
+    header.extend(
+        window_labels(app, n)
+            .iter()
+            .map(|l| Span::raw(fit(l, 4) + " ")),
+    );
+    let mut lines = vec![Line::from(header)];
+    for (l, tags) in cache.iter().enumerate().take(app.reached_layer()) {
+        let mut row = vec![Span::raw(fit(&format!("layer {:2}", l + 1), ZOOM_LABEL))];
+        for &t in tags.get(app.window_start()..).unwrap_or(&[]) {
+            let style = match t {
+                CacheTag::Read => grey(60),
+                CacheTag::Write => grey(230),
+                CacheTag::Recomputed => Style::default().bg(Color::Red),
+            };
+            row.push(Span::styled("   ", style));
+            row.push(Span::raw("  "));
+        }
+        if l + 1 == app.layer && tags.last() == Some(&CacheTag::Write) {
+            row.push(Span::raw("← write"));
+        }
+        lines.push(Line::from(row));
+    }
+    lines
+}
+
+/// The header plus the `rows` layer rows nearest the selected (1-based) layer.
+fn map_window(mut map: Vec<Line<'static>>, rows: usize, layer: usize) -> Vec<Line<'static>> {
+    if map.is_empty() {
+        return map;
+    }
+    let layers = map.split_off(1);
+    let rows = rows.min(layers.len());
+    let first = layer
+        .saturating_sub(1)
+        .saturating_sub(rows / 2)
+        .min(layers.len() - rows);
+    map.extend(layers.into_iter().skip(first).take(rows));
+    map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{Stage, Zoom};
+    use crate::app::test_support::fake_trace;
+    use crate::ui::tests::{lines, press, render, running, zoomed};
+    use ratatui::crossterm::event::KeyCode;
+
+    #[test]
+    fn head_zoom_shows_pipeline() {
+        let a = zoomed("abc", Zoom::Head);
+        let text = render(&a, 120, 40);
+        assert!(text.contains("head output (before W_O)"));
+        assert!(text.contains("Head 2·1"));
+        assert!(text.contains("softmax"));
+        let b: Vec<char> = text.chars().collect();
+        assert!(b.windows(2).any(|w| w[0] == '+' && w[1].is_ascii_digit()));
+        assert!(text.contains("write"));
+        // out = Σ_j attention[0][2][j] · v[0][j], block 2, rebuilt from fake_trace's closed form
+        let blk = &a.trace.as_ref().unwrap().blocks[1];
+        let out = head_out(&blk.attention[0][2], &blk.v[0], 0, 2);
+        assert_eq!(out.len(), 3);
+        for (d, o) in out.iter().enumerate() {
+            // v = 2 + (1000 + 10p + d)·0.01, weights 1/3 over p = 0..=2
+            assert!((o - (12.1 + 0.01 * d as f32)).abs() < 1e-4, "{d}: {o}");
+        }
+    }
+
+    #[test]
+    fn head_zoom_reads_after_append() {
+        let mut a = running("ab");
+        while a.stage != Stage::Drawn {
+            press(&mut a, KeyCode::Enter);
+        }
+        press(&mut a, KeyCode::Enter);
+        a.set_trace(fake_trace(3));
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.stage, Stage::Block(1));
+        press(&mut a, KeyCode::Char('z'));
+        let text = render(&a, 120, 40);
+        assert!(text.contains("read"));
+        assert!(text.contains("write"));
+        assert!(text.contains("← write"));
+    }
+
+    #[test]
+    fn head_zoom_rows_follow_query() {
+        let mut a = zoomed("abc", Zoom::Head);
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.zoom_pos, 1);
+        let rows = lines(&render(&a, 120, 40), 120);
+        let keys: Vec<&String> = rows.iter().filter(|r| r.starts_with("│k ")).collect();
+        assert_eq!(keys.len(), 2);
+        // CharTokenizer: 'a' → "!", 'b' → "\"", 'c' → "#"
+        assert!(keys[0].starts_with("│k  !"));
+        assert!(keys[1].starts_with("│k  \""));
+        assert!(!keys.iter().any(|r| r.starts_with("│k  #")));
+    }
+
+    #[test]
+    fn zooms_render_one_token() {
+        let mut a = running("a");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.stage, Stage::Block(1));
+        press(&mut a, KeyCode::Char('z'));
+        render(&a, 120, 40);
+        render(&a, 40, 12);
+        press(&mut a, KeyCode::Char('m'));
+        render(&a, 120, 40);
+        render(&a, 40, 12);
+    }
+
+    #[test]
+    fn zooms_render_in_every_stage() {
+        for (w, h) in [(40, 12), (80, 24), (120, 40), (200, 60)] {
+            let mut a = running("abc");
+            press(&mut a, KeyCode::Enter);
+            press(&mut a, KeyCode::Char('z'));
+            assert_eq!(a.zoom, Zoom::Head);
+            loop {
+                render(&a, w, h);
+                let was_drawn = a.stage == Stage::Drawn;
+                press(&mut a, KeyCode::Enter);
+                if was_drawn {
+                    render(&a, w, h); // committed, trace not yet replaced
+                    break;
+                }
+            }
+            a.set_trace(fake_trace(4));
+            let text = render(&a, w, h);
+            assert_eq!(a.stage, Stage::Embedding);
+            assert!(text.contains("Head"));
+            assert!(!text.contains("q ⊙ k"));
+            press(&mut a, KeyCode::Enter);
+            assert!(render(&a, w, h).contains("q ⊙ k") || h < 24);
+        }
+    }
+}

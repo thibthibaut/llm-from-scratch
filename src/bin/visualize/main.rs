@@ -2,6 +2,7 @@ mod app;
 mod cache;
 mod pca;
 mod ui;
+mod zoom;
 
 use app::{App, Effect};
 use clap::Parser;
