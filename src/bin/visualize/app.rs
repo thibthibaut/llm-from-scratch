@@ -151,7 +151,12 @@ impl<T: Tokenizer> App<T> {
             KeyCode::Char('z') => self.toggle_zoom(Zoom::Head),
             KeyCode::Char('m') => self.toggle_zoom(Zoom::Mlp),
             KeyCode::Char('s') if self.zoom == Zoom::Off => self.show_scores = !self.show_scores,
-            KeyCode::Char('[') if self.zoom != Zoom::Off => self.layer = (self.layer - 1).max(1),
+            KeyCode::Char('[') if self.zoom != Zoom::Off => {
+                // no-op at reached 0 (zoom left open across a new pass)
+                if self.reached_layer() >= 1 {
+                    self.layer = self.layer.saturating_sub(1).max(1)
+                }
+            }
             KeyCode::Char(']') if self.zoom != Zoom::Off => {
                 self.layer = (self.layer + 1).min(self.reached_layer())
             }
@@ -160,7 +165,7 @@ impl<T: Tokenizer> App<T> {
                 self.zoom_pos = self.zoom_pos.saturating_sub(1).max(self.window_start())
             }
             KeyCode::Down if self.zoom != Zoom::Off => {
-                let last = self.model_input().len() - 1;
+                let last = self.model_input().len().saturating_sub(1);
                 self.zoom_pos = (self.zoom_pos + 1).min(last)
             }
             KeyCode::Esc => {
@@ -651,6 +656,23 @@ mod tests {
         press(&mut a, ch('z'), 1);
         press(&mut a, ch('['), 1);
         assert_eq!(a.layer, 2);
+    }
+
+    #[test]
+    fn brackets_noop_at_layer_zero() {
+        let mut a = at_block1();
+        press(&mut a, ch('z'), 1);
+        press(&mut a, KeyCode::Enter, 4); // to Drawn
+        assert_eq!(enter(&mut a), Some(Effect::RunForward));
+        a.set_trace(fake_trace(3));
+        assert_eq!(
+            (a.stage, a.layer, a.zoom),
+            (Stage::Embedding, 0, Zoom::Head)
+        );
+        press(&mut a, ch('['), 1);
+        assert_eq!(a.layer, 0);
+        press(&mut a, ch(']'), 1);
+        assert_eq!((a.layer, a.zoom), (0, Zoom::Head));
     }
 
     #[test]
