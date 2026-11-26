@@ -1,3 +1,4 @@
+use crate::cache::{CacheTag, KvSnapshot, cache_tags};
 use llm_from_scratch::model::Trace;
 use llm_from_scratch::sampling::Sampler;
 use llm_from_scratch::tokenizer::{Token, Tokenizer};
@@ -5,6 +6,15 @@ use rand::rngs::StdRng;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub const MAX_MODEL_TOKENS: usize = 256;
+/// Tokens shown in the embedding and attention panels (the last ones of the input).
+pub const WINDOW: usize = 8;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Zoom {
+    Off,
+    Head,
+    Mlp,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -34,6 +44,11 @@ pub struct App<T: Tokenizer> {
     pub trace: Option<Trace>,
     pub drawn: Option<usize>,
     pub tokenizer: T,
+    pub zoom: Zoom,
+    pub zoom_pos: usize, // absolute index into model_input() of the selected token
+    pub show_scores: bool,
+    pub cache: Option<Vec<Vec<CacheTag>>>, // [layer][position] for the current trace
+    prev_kv: Option<KvSnapshot>,
     rng: StdRng,
     num_layers: usize,
     num_heads: usize,
@@ -65,6 +80,11 @@ impl<T: Tokenizer> App<T> {
             trace: None,
             drawn: None,
             tokenizer,
+            zoom: Zoom::Off,
+            zoom_pos: 0,
+            show_scores: false,
+            cache: None,
+            prev_kv: None,
             rng,
             num_layers,
             num_heads,
@@ -99,7 +119,15 @@ impl<T: Tokenizer> App<T> {
         }
     }
 
+    pub fn window_start(&self) -> usize {
+        self.model_input().len().saturating_sub(WINDOW)
+    }
+
     pub fn set_trace(&mut self, trace: Trace) {
+        let now = KvSnapshot::new(self.model_input(), &trace);
+        self.cache = Some(cache_tags(self.prev_kv.as_ref(), &now));
+        self.prev_kv = Some(now);
+        self.zoom_pos = self.model_input().len().saturating_sub(1);
         self.trace = Some(trace);
         self.drawn = None;
         self.go(Stage::Embedding);
@@ -120,6 +148,21 @@ impl<T: Tokenizer> App<T> {
         match key.code {
             KeyCode::Enter => return self.advance(),
             KeyCode::Char(' ') if self.stage != Stage::Drawn => self.go(Stage::Sampler),
+            KeyCode::Char('z') => self.toggle_zoom(Zoom::Head),
+            KeyCode::Char('m') => self.toggle_zoom(Zoom::Mlp),
+            KeyCode::Char('s') if self.zoom == Zoom::Off => self.show_scores = !self.show_scores,
+            KeyCode::Char('[') if self.zoom != Zoom::Off => self.layer = (self.layer - 1).max(1),
+            KeyCode::Char(']') if self.zoom != Zoom::Off => {
+                self.layer = (self.layer + 1).min(self.reached_layer())
+            }
+            KeyCode::Esc if self.zoom != Zoom::Off => self.zoom = Zoom::Off,
+            KeyCode::Up if self.zoom != Zoom::Off => {
+                self.zoom_pos = self.zoom_pos.saturating_sub(1).max(self.window_start())
+            }
+            KeyCode::Down if self.zoom != Zoom::Off => {
+                let last = self.model_input().len() - 1;
+                self.zoom_pos = (self.zoom_pos + 1).min(last)
+            }
             KeyCode::Esc => {
                 self.stage = Stage::Editing;
                 self.trace = None;
@@ -135,6 +178,14 @@ impl<T: Tokenizer> App<T> {
             _ => {}
         }
         None
+    }
+
+    fn toggle_zoom(&mut self, z: Zoom) {
+        if self.zoom == z {
+            self.zoom = Zoom::Off;
+        } else if self.layer >= 1 {
+            self.zoom = z;
+        }
     }
 
     fn edit_key(&mut self, code: KeyCode) -> Option<Effect> {
@@ -237,11 +288,58 @@ pub(crate) mod test_support {
             residual: vec![vec![0.5; 4]; seq],
             ..Default::default()
         };
+        let blocks = (0..2)
+            .map(|l| {
+                // values depend on (layer, head, pos, dim) only, so passes agree on shared positions
+                let heads = |off: f32| -> Vec<Vec<Vec<f32>>> {
+                    (0..2)
+                        .map(|h| {
+                            (0..seq)
+                                .map(|p| {
+                                    (0..3)
+                                        .map(|d| {
+                                            off + (l * 1000 + h * 100 + p * 10 + d) as f32 * 0.01
+                                        })
+                                        .collect()
+                                })
+                                .collect()
+                        })
+                        .collect()
+                };
+                let scores = (0..2)
+                    .map(|h| {
+                        (0..seq)
+                            .map(|i| {
+                                (0..seq)
+                                    .map(|j| {
+                                        if j <= i {
+                                            (h + i + j) as f32 * 0.1
+                                        } else {
+                                            f32::NEG_INFINITY
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .collect()
+                    })
+                    .collect();
+                BlockTrace {
+                    q: heads(0.0),
+                    k: heads(1.0),
+                    v: heads(2.0),
+                    scores,
+                    mlp_in: vec![vec![0.2; 4]; seq],
+                    mlp_hidden: vec![vec![0.3; 8]; seq],
+                    mlp_out: vec![vec![0.4; 4]; seq],
+                    ..block.clone()
+                }
+            })
+            .collect();
         let mut last_logits = vec![0.0; 64];
         last_logits[7] = 10.0;
         Trace {
             embedding: vec![vec![0.1; 4]; seq],
-            blocks: vec![block.clone(), block],
+            blocks,
             last_logits,
         }
     }
@@ -474,6 +572,156 @@ mod tests {
         type_str(&mut a, &"abcdefghij".repeat(4));
         assert_eq!(a.model_input().len(), 16);
         assert_eq!(a.model_input(), &a.tokens[24..]);
+    }
+
+    fn at_block1() -> App<CharTokenizer> {
+        let mut a = at_embedding();
+        enter(&mut a);
+        a
+    }
+    fn press(a: &mut App<CharTokenizer>, c: KeyCode, n: usize) {
+        for _ in 0..n {
+            a.on_key(key(c));
+        }
+    }
+    fn ch(c: char) -> KeyCode {
+        KeyCode::Char(c)
+    }
+
+    #[test]
+    fn z_and_m_toggle_and_switch() {
+        let mut a = at_block1();
+        for (c, want) in [
+            ('z', Zoom::Head),
+            ('m', Zoom::Mlp),
+            ('m', Zoom::Off),
+            ('z', Zoom::Head),
+            ('z', Zoom::Off),
+        ] {
+            press(&mut a, ch(c), 1);
+            assert_eq!(a.zoom, want);
+        }
+    }
+
+    #[test]
+    fn zoom_needs_a_block() {
+        let mut a = at_embedding();
+        press(&mut a, ch('z'), 1);
+        press(&mut a, ch('m'), 1);
+        assert_eq!(a.zoom, Zoom::Off);
+    }
+
+    #[test]
+    fn esc_closes_zoom_only() {
+        let mut a = at_block1();
+        press(&mut a, ch('z'), 1);
+        press(&mut a, KeyCode::Esc, 1);
+        assert_eq!((a.zoom, a.stage), (Zoom::Off, Stage::Block(1)));
+        press(&mut a, KeyCode::Esc, 1);
+        assert_eq!(a.stage, Stage::Editing);
+    }
+
+    #[test]
+    fn arrows_pick_query_in_zoom() {
+        let mut a = app();
+        type_str(&mut a, "abc");
+        enter(&mut a);
+        a.set_trace(fake_trace(3));
+        enter(&mut a);
+        press(&mut a, ch('z'), 1);
+        assert_eq!(a.zoom_pos, 2);
+        press(&mut a, KeyCode::Up, 1);
+        assert_eq!(a.zoom_pos, 1);
+        press(&mut a, KeyCode::Up, 5);
+        assert_eq!(a.zoom_pos, 0);
+        press(&mut a, KeyCode::Down, 5);
+        assert_eq!((a.zoom_pos, a.layer), (2, 1));
+    }
+
+    #[test]
+    fn brackets_change_layer_in_zoom() {
+        let mut a = at_embedding();
+        press(&mut a, KeyCode::Enter, 3); // Output, reached 2
+        press(&mut a, ch('z'), 1);
+        assert_eq!(a.layer, 2);
+        for (c, want) in [('[', 1), ('[', 1), (']', 2), (']', 2)] {
+            press(&mut a, ch(c), 1);
+            assert_eq!(a.layer, want);
+        }
+        press(&mut a, ch('z'), 1);
+        press(&mut a, ch('['), 1);
+        assert_eq!(a.layer, 2);
+    }
+
+    #[test]
+    fn s_toggles_scores_and_persists() {
+        let mut a = at_block1();
+        press(&mut a, ch('s'), 1);
+        assert!(a.show_scores);
+        a.set_trace(fake_trace(2));
+        assert!(a.show_scores);
+        enter(&mut a);
+        press(&mut a, ch('z'), 1);
+        press(&mut a, ch('s'), 1);
+        assert!(a.show_scores);
+    }
+
+    #[test]
+    fn zoom_keys_beat_sampler_keys() {
+        let mut a = at_sampler();
+        press(&mut a, ch('z'), 1);
+        assert_eq!(
+            (a.zoom, a.top_k, a.temperature),
+            (Zoom::Head, Some(10), 1.0)
+        );
+    }
+
+    #[test]
+    fn zoom_keys_are_text_in_edit_mode() {
+        let mut a = app();
+        type_str(&mut a, "zms[]");
+        assert_eq!(a.text, "zms[]");
+        assert_eq!((a.zoom, a.show_scores), (Zoom::Off, false));
+    }
+
+    #[test]
+    fn zoom_survives_new_pass() {
+        let mut a = at_block1();
+        press(&mut a, ch('z'), 1);
+        press(&mut a, KeyCode::Enter, 4); // Output, Sampler, Drawn
+        assert_eq!(a.stage, Stage::Drawn);
+        assert_eq!(enter(&mut a), Some(Effect::RunForward));
+        a.set_trace(fake_trace(3));
+        assert_eq!(
+            (a.zoom, a.zoom_pos, a.stage),
+            (Zoom::Head, 2, Stage::Embedding)
+        );
+    }
+
+    fn append_one() -> App<CharTokenizer> {
+        let mut a = at_embedding();
+        press(&mut a, KeyCode::Enter, 5); // to Drawn
+        assert_eq!(enter(&mut a), Some(Effect::RunForward));
+        a.set_trace(fake_trace(3));
+        a
+    }
+
+    #[test]
+    fn cache_tags_after_append() {
+        let a = append_one();
+        let want = vec![CacheTag::Read, CacheTag::Read, CacheTag::Write];
+        assert_eq!(a.cache, Some(vec![want.clone(), want]));
+    }
+
+    #[test]
+    fn prev_kv_survives_esc() {
+        let mut a = at_embedding();
+        press(&mut a, KeyCode::Esc, 1);
+        type_str(&mut a, "c");
+        assert_eq!(enter(&mut a), Some(Effect::RunForward));
+        a.set_trace(fake_trace(3));
+        let want = vec![CacheTag::Read, CacheTag::Read, CacheTag::Write];
+        assert_eq!(a.cache, Some(vec![want.clone(), want]));
     }
 
     #[test]

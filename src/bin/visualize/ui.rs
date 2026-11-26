@@ -1,4 +1,4 @@
-use crate::app::{App, Stage};
+use crate::app::{App, Stage, WINDOW};
 use crate::pca::Pca;
 use llm_from_scratch::sampling::Sampler;
 use llm_from_scratch::tokenizer::{Token, Tokenizer};
@@ -8,8 +8,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-/// Tokens shown in the embedding and attention panels (the last ones of the input).
-pub const WINDOW: usize = 8;
 const TOP: usize = 10;
 const LABEL: usize = 8;
 
