@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Inference visualizer</title>
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/fira_code.min.css"
+    />
+    
+<script type="module">
+import init, * as bindings from '/llm-from-scratch/visualize-web-6e79864f9173220.js';
+
+const wasm = await init({ module_or_path: '/llm-from-scratch/visualize-web-947c768742b24266_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+    <style>
+      html, body { margin: 0; height: 100vh; overflow: hidden; background: #000; }
+      /* The canvas follows the window; ratzilla re-grids it on resize. */
+      canvas { display: block; width: 100vw; height: 100vh; outline: none; }
+    </style>
+  <link rel="modulepreload" href="/llm-from-scratch/visualize-web-6e79864f9173220.js" crossorigin="anonymous" integrity="sha384-QdyzpQYcDOXxHwQ6exTFQqt5+C6tSRUYN9i6zrvFCP3PNod19exEAXqFagrR+4BG"><link rel="preload" href="/llm-from-scratch/visualize-web-947c768742b24266_bg.wasm" crossorigin="anonymous" integrity="sha384-glQd8LtPWZA9yvat0wgzC0QuMRcSsrRPOR0i0cJtdXBw6kKEgknM895ACkBiWO3B" as="fetch" type="application/wasm"></head>
+  <body>
+    <script type="module">
+      const focus = () => document.querySelector("canvas")?.focus();
+      window.addEventListener("TrunkApplicationStarted", focus);
+      document.addEventListener("click", focus);
+      // Keys belong to the app (Space, arrows, '/' would scroll or open quick-find); leave
+      // browser shortcuts (Ctrl/Cmd+…) alone.
+      window.addEventListener("keydown", (e) => {
+        if (!e.ctrlKey && !e.metaKey) e.preventDefault();
+      });
+    </script>
+  </body>
+</html>
